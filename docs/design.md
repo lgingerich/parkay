@@ -1,8 +1,9 @@
 # Parkay design
 
-Status: first draft. This document records the design direction agreed so far. It
-describes intent, not measured results. Every performance expectation in it is a
-hypothesis until the benchmark harness confirms it.
+Status: living document, last reviewed 2026-11-20. It records the design direction
+agreed so far and what has been built (section 13). It describes intent, not
+measured results: every performance expectation in it is a hypothesis until a
+benchmark confirms it, and measurements are logged in `docs/perf/`, not here.
 
 ## 1. Purpose
 
@@ -82,10 +83,17 @@ The scanner and the adapters sit on top of it.
 
 ### Packaging
 
-The project starts as a single crate with modules for each layer. It is split
-into several crates only if there is a concrete reason, such as optional heavy
+The library is a single crate with modules for each layer. It is split into
+several crates only if there is a concrete reason, such as optional heavy
 dependencies. Keeping the kernels in the same crate as their callers avoids
 inlining barriers across crate boundaries.
+
+The repository is a workspace around that crate. The other members are
+development tooling that never ships: a task runner (`xtask`) and benchmark
+support (`bench-support`). Fuzz targets live in a separate crate with its own
+workspace, so the library stays on the pinned stable toolchain. Internal modules
+are exposed to the benchmarks and fuzz targets through an `internals` feature,
+which is not a stable API.
 
 Integrations that pull in external dependencies (Arrow, DataFusion) are optional
 so the core stays dependency-light.
@@ -96,7 +104,8 @@ Third-party crates on the hot path were chosen by benchmarking the candidates
 on real Parquet page data, on one Apple Silicon machine. The comparison code was
 throwaway and is not in this repository. The rule applied: a C-backed library is
 acceptable where its advantage is clear, and pure Rust is preferred where
-performance is about the same.
+performance is about the same. Each crate is added to the build when the code
+that needs it is written; none of those in the table below is a dependency yet.
 
 | Need | Choice | Basis |
 |---|---|---|
@@ -114,6 +123,10 @@ Chosen without a comparison because they are off the hot path or rarely used:
 
 Codecs sit behind one internal interface, so any of these can be replaced
 without touching callers.
+
+Other dependencies: `thiserror` for the library's error types. Development only:
+`proptest`, `criterion`, the arrow-rs `parquet` crate (baseline, differential
+tests, and fixture generation), and `libfuzzer-sys` in the fuzz crate.
 
 ### The core is sans-I/O
 
@@ -273,6 +286,33 @@ compared against it.
   keyed by path and object version, and possibly shared across concurrent scans.
   Its form (the retained footer bytes plus an index into them) should stay cheap
   to keep and share.
+
+#### The Thrift layer
+
+Footer and page-header metadata is Thrift compact protocol. Parkay has its own
+reader for it, because the alternatives do not fit the lazy design: the general
+`thrift` crate decodes everything into owned structures, and arrow-rs's custom
+parser is private to that crate. The reader:
+
+- Works on a borrowed byte slice, allocates nothing, and borrows binary values
+  from the input.
+- Knows nothing about Parquet's structures. It imports nothing else from the
+  crate, so it could become its own crate unchanged.
+- Offers two ways over a value: the read methods, which decode and validate it,
+  and `skip`, which passes over it. Skipping validates structure (type codes,
+  sizes against the remaining input, nesting depth) but not the values it
+  discards, such as integer widths. A value skipped at open can still fail when
+  it is later decoded.
+- Accepts the legacy and non-conforming output that real writers produce, such as
+  fastparquet's empty lists with element type 0 and the older `0` for false in
+  bool lists, and rejects anything else malformed.
+- Reports every error with the byte offset of the bad value, in an error type kept
+  small because every read returns it.
+
+Skipping is the main cost of opening a file in the lazy design, so its
+performance is tracked in `docs/perf/thrift-skip.md`. Its hot loop has proved
+sensitive to small changes and to the shape of the input, so changes there are
+checked on more than one kind of footer and in the generated assembly.
 
 #### Decoding metadata structures
 
@@ -564,9 +604,10 @@ the core can offer, not for what the first engine can consume.
 
 ## 9. Format scope
 
-- Parkay targets one tagged release of the Parquet format specification, to be
-  pinned and recorded in the repository. Proposed or in-progress format changes
-  are not planned around; the implementation catches up later if needed.
+- Parkay targets one tagged release of the Parquet format specification:
+  `apache-parquet-format-2.14.0`, whose `parquet.thrift` is vendored at
+  `format/parquet.thrift`. Proposed or in-progress format changes are not
+  planned around; the implementation catches up later if needed.
 - The **writer** emits a modern subset of that version, governed by the
   compatibility profile.
 - The **reader** accepts what exists in real files, which includes deprecated
@@ -588,7 +629,9 @@ buffers and any unchecked indexing that measurement shows is necessary. The
 intended approach is to keep the crate-wide default and confine any such
 `unsafe` to the buffer and kernel modules behind scoped, documented lint
 expectations, with every block carrying a safety comment as the existing lints
-require. Introducing the first such exception needs explicit sign-off.
+require. Introducing the first such exception needs explicit sign-off. Inline
+assembly is not used anywhere. The Thrift layer is entirely safe code and stays
+that way.
 
 ### Untrusted input
 
@@ -615,16 +658,25 @@ require. Introducing the first such exception needs explicit sign-off.
   pyarrow, parquet-java, DuckDB, Spark, and Go implementations) guards the
   reader's tolerance of non-conforming but common output, such as fastparquet's
   empty lists with element type 0.
+- Parsers and round trips have property tests: generated values are encoded and
+  decoded back, and arbitrary bytes must never cause a panic.
 - Fuzzing is part of the project from the start, covering the footer parser,
   page decoding, and each kernel. Fuzz targets run under a nightly toolchain;
-  the crate itself stays on the pinned toolchain.
+  the crate itself stays on the pinned toolchain. Targets check more than the
+  absence of panics where an oracle exists: two paths through Parkay that must
+  agree (skipping a value and decoding it), and arrow-rs where both accept the
+  input. They are seeded from real footers and run with a short per-input
+  timeout, so input that makes the work grow out of proportion is caught. A fuzz
+  oracle is only trusted after it has been shown to catch a deliberately planted
+  bug.
 - Interpreter-based checking covers the scalar paths and framing code. It does
   not cover most SIMD intrinsics, which is why the scalar-reference tests carry
   that weight.
 
 ## 11. Benchmarking
 
-The benchmark harness is the first thing built. It provides:
+The harness grows with the code. It is run through the task runner
+(`cargo xtask bench`, `report`, `profile`, `asm`) and aims to provide:
 
 - arrow-rs as the baseline on identical files and queries.
 - The relevant hardware limit for each workload (memory copy rate, raw codec
@@ -639,6 +691,23 @@ The benchmark harness is the first thing built. It provides:
   benchmark does not show it.
 - Tracking over time, so regressions (including autovectorization regressions
   from toolchain changes) are caught.
+
+Practice so far:
+
+- Benchmarks run one at a time, never alongside builds or other benchmarks.
+- Fixtures include real files (parquet-testing), synthetic footers of chosen
+  shapes, and external sets such as
+  [alamb/parquet_footer_parsing](https://github.com/alamb/parquet_footer_parsing),
+  which allows comparison with published arrow-rs results. A change is judged on
+  more than one shape of input: synthetic fixtures alone have been shown to
+  over-represent one shape.
+- Profiling uses sampling (`samply`, macOS `sample`), the generated assembly, and
+  hardware counters (Xcode's `xctrace` CPU Counters template on macOS), so a
+  change is explained, not only timed.
+- Every forced inline or cold annotation is backed by a measurement, and what was
+  tried, kept, and rejected is logged in `docs/perf/`.
+- Not yet covered: x86-64 measurements, tracking results over time, and request
+  counting for object storage.
 
 ## 12. Decisions against and deferrals
 
@@ -655,6 +724,9 @@ The benchmark harness is the first thing built. It provides:
 | Arbitrary expression evaluation inside the reader | Engine territory; covered by the block-synchronous scan |
 | Requiring input padding for SIMD loads | Not possible for borrowed or memory-mapped input |
 | Planning around proposed format changes | Target the pinned specification and catch up later |
+| Generated Thrift decoders (the `thrift` crate or a code generator) | They decode eagerly into owned structures; the lazy design needs a reader that can skip |
+| Inline assembly | Not used anywhere; SIMD goes through `fearless_simd` |
+| Bulk-skipping Thrift lists of fixed-width types | No Parquet structure contains such a list |
 
 ### Deferred
 
@@ -671,8 +743,13 @@ The benchmark harness is the first thing built. It provides:
 | Adaptive sizing of the speculative tail read | A caller-supplied hint suffices |
 | Views into page bytes and zero-copy value views | Need retained page buffers, a second buffering model |
 | A range-based selection representation | Added only if the bitmask proves costly for sparse selections |
+| A Thrift encoder | Built with the writer, along with encode/decode round-trip fuzzing |
+| A vectorized pass marking varint boundaries for Thrift skipping | The one untried structural idea for skip speed; set aside for now |
+| Fuzzing in CI | Fuzz targets are run by hand for now |
 
 ## 13. Order of work
+
+The overall order:
 
 1. Benchmark harness with the arrow-rs baseline and hardware-limit measurements.
 2. A vertical slice: flat nullable integer and dictionary-encoded columns, read
@@ -690,11 +767,22 @@ The benchmark harness is the first thing built. It provides:
 9. Views into page bytes and the remaining format surface, each as evidence
    calls for it.
 
+Step 2 is being built from the bottom up, in small pieces that each end with tests
+passing:
+
+- Done: the specification pinned and vendored; the Thrift compact-protocol reader,
+  with property tests, fuzzing, and its skip path profiled and optimized; the
+  first part of the benchmark harness (step 1), covering the Thrift layer.
+- Next: opening a file without I/O (accepting any tail of the file and reporting
+  what is missing) and the lazy footer index, with the first metadata decoders
+  and their comparison against arrow-rs.
+- Then: page framing for one column chunk (headers, checksums, decompression with
+  length checks), and a first scalar read of flat nullable integer columns.
+
 ## 14. Open questions
 
 - **Unsafe policy.** Confirm the scoped approach to `unsafe` described in
   section 10.
-- **Pinned specification version.** Choose and record the tag.
 - **Engine interface fit.** How much of pruning, selection, and encoded output
   the first engine's extension points can actually consume.
 - **Fusion extent.** Settled by the experiment in step 3.
@@ -702,3 +790,8 @@ The benchmark harness is the first thing built. It provides:
 - **Ownership of retained metadata.** Whether the footer bytes behind lazily
   decoded metadata are uniquely owned or shared (for metadata caches and concurrent
   scans), and with which type.
+- **Mismatched field types in metadata.** What a decoder does with a field that
+  has the expected id but an unexpected wire type: an error, or skipping the
+  field.
+- **Macros for metadata decoders.** Whether the long tail of simple structures is
+  generated, decided once the first decoders exist.
