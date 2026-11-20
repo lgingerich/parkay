@@ -1,0 +1,25 @@
+# Fuzz targets, run with cargo-fuzz on a nightly toolchain:
+#   cargo +nightly fuzz run <target>
+# A separate crate (its own workspace) so the main crate stays on the pinned
+# toolchain and libfuzzer-sys never enters its dependency tree.
+[package]
+name = "parkay-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+parkay = { path = "..", features = ["internals"] }
+
+[[bin]]
+name = "thrift_skip"
+path = "fuzz_targets/thrift_skip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

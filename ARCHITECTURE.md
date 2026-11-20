@@ -9,8 +9,8 @@ must keep.
 
 `parkay` is a ground-up Rust Parquet reader and writer aimed at maximum performance,
 measured against the arrow-rs `parquet` crate as the baseline. It is a single library
-crate with no dependencies. No functionality exists yet: `src/lib.rs` holds only the
-crate docs.
+crate whose only runtime dependency is `thiserror`. The only code so far is the Thrift
+compact-protocol reader that M2's footer parser will build on.
 
 ## Format target
 
@@ -24,21 +24,37 @@ crate docs.
 
 - `testdata/parquet-testing` is a git submodule of `apache/parquet-testing`, pinned to
   a commit. Tests build paths to it from `env!("CARGO_MANIFEST_DIR")`.
-- Run `git submodule update --init` after cloning. CI does not check out submodules
-  yet; enable that in the same change that adds the first test using them.
+- Run `git submodule update --init` after cloning. CI checks out submodules.
 
 ## Module Boundaries
 
-None yet. The planned layering (kernels, sans-I/O core, reference scanner,
-integrations) is in `docs/design.md` section 3. Add each module here as it lands.
+The planned layering (kernels, sans-I/O core, reference scanner, integrations) is in
+`docs/design.md` section 3. Modules so far:
+
+- `src/thrift.rs`: Thrift compact-protocol reader over a borrowed `&[u8]`. Knows
+  nothing about Parquet's structs. It must import nothing else from the crate, so it
+  can move to its own crate unchanged.
+
+Internal modules are crate-private by default. The `internals` Cargo feature makes them
+public and hidden from docs, for `fuzz/` and benchmarks, which build as separate crates.
+It is not a stable API. `src/thrift.rs` has no non-test caller until M2, so `src/lib.rs`
+carries a temporary `dead_code` expectation on it, marked `TODO(M2)`.
+
+`fuzz/` is a separate crate with its own workspace, run with
+`cargo +nightly fuzz run <target>`, so the main crate stays on the pinned toolchain.
 
 ## Core Invariants
 
 - The core performs no I/O and spawns no threads (`docs/design.md` section 3).
 - Corrupt or untrusted input produces an error, never a panic or undefined behavior.
+- Every size the Thrift reader returns has been checked against the remaining input.
+  Code built on it may allocate in proportion to a size, but must not pre-allocate
+  `size * size_of::<T>()` for a decoded struct `T`: a 1-byte empty struct on the wire
+  can decode into hundreds of bytes.
+- Readers accept the legacy and ecosystem variants that real writers emit (such as
+  `0` for false in Thrift bool lists), as long as accepting them costs no performance
+  and keeps the design. Anything else malformed is an error.
 
 ## Forbidden Patterns / Dependencies
 
-None beyond `AGENTS.md` and `docs/design.md` section 12. There are no runtime or dev
-dependencies, and `Cargo.toml` lints `unused_dependencies` as a warning that CI treats
-as an error.
+None beyond `AGENTS.md` and `docs/design.md` section 12. `Cargo.toml` lints `unused_dependencies` as a warning that CI treats as an error.

@@ -8,7 +8,13 @@ readme = "README.md"
 repository = "https://github.com/lgingerich/parkay"
 license = "MIT"
 
+[features]
+# Makes internal modules public (and hidden from docs) so the fuzz targets and
+# benchmarks, which build as separate crates, can call them. Not a stable API.
+internals = []
+
 [dependencies]
+thiserror = "2.0.21"
 
 [dev-dependencies]
 criterion = "0.8.2"

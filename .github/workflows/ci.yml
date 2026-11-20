@@ -30,6 +30,9 @@ jobs:
       RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Test fixtures live in the testdata/parquet-testing submodule.
+          submodules: true
       # Installs the toolchain and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       # Saved from `main` only: pull requests restore `main`'s cache without evicting it.
