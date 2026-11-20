@@ -1,0 +1,8 @@
+# Project task runner: `cargo xtask <command>`. See `cargo xtask help`.
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]

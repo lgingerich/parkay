@@ -5,6 +5,7 @@ use proptest::prelude::*;
 
 use super::{
     CompactReader, ElementType, Field, FieldCursor, FieldType, MAX_SKIP_DEPTH, ThriftError,
+    VarintTarget,
 };
 
 // ---------------------------------------------------------------------------
@@ -276,16 +277,19 @@ fn padded_varint_within_width_is_accepted() {
 fn varint_with_bits_beyond_width_is_rejected() {
     let overflow = |target| ThriftError::VarintOverflow { offset: 0, target };
     // Third byte of an i16 may hold only 2 bits.
-    assert_eq!(reader(&[0xFF, 0xFF, 0x04]).read_i16(), Err(overflow("i16")));
+    assert_eq!(
+        reader(&[0xFF, 0xFF, 0x04]).read_i16(),
+        Err(overflow(VarintTarget::I16))
+    );
     // Fifth byte of an i32 may hold only 4 bits.
     assert_eq!(
         reader(&[0xFF, 0xFF, 0xFF, 0xFF, 0x10]).read_i32(),
-        Err(overflow("i32"))
+        Err(overflow(VarintTarget::I32))
     );
     // Tenth byte of an i64 may hold only 1 bit.
     let mut long = [0xFF; 10];
     long[9] = 0x02;
-    assert_eq!(reader(&long).read_i64(), Err(overflow("i64")));
+    assert_eq!(reader(&long).read_i64(), Err(overflow(VarintTarget::I64)));
 }
 
 #[test]
@@ -293,9 +297,12 @@ fn varint_longer_than_width_is_rejected() {
     let overflow = |target| ThriftError::VarintOverflow { offset: 0, target };
     assert_eq!(
         reader(&[0x80, 0x80, 0x80, 0x00]).read_i16(),
-        Err(overflow("i16"))
+        Err(overflow(VarintTarget::I16))
     );
-    assert_eq!(reader(&[0x80; 11]).read_i64(), Err(overflow("i64")));
+    assert_eq!(
+        reader(&[0x80; 11]).read_i64(),
+        Err(overflow(VarintTarget::I64))
+    );
 }
 
 #[test]
@@ -396,6 +403,18 @@ fn invalid_type_codes_are_rejected() {
 }
 
 #[test]
+fn empty_list_with_type_zero_is_accepted() {
+    // fastparquet writes empty lists as a single 0x00 byte (arrow-rs issue 8826).
+    let header = reader(&[0x00]).read_list_header().unwrap();
+    assert_eq!(header.size(), 0);
+    // Inside a struct: field 1 is such a list, then stop.
+    let bytes = [0x19, 0x00, 0x00];
+    let mut r = reader(&bytes);
+    r.skip(ElementType::Struct).unwrap();
+    assert_eq!(r.position(), bytes.len());
+}
+
+#[test]
 fn list_headers_decode_in_both_forms() {
     let mut bytes = vec![0xE5];
     bytes.extend([0; 14]);
@@ -443,6 +462,57 @@ fn sizes_above_i32_max_are_rejected() {
 }
 
 #[test]
+fn skip_ignores_errors_in_values_it_discards() {
+    // An i16 field whose varint overflows i16: reading rejects it, skipping does not.
+    let wide_varint = [0x14, 0xFF, 0xFF, 0x04, 0x00];
+    let mut skipper = reader(&wide_varint);
+    skipper.skip(ElementType::Struct).unwrap();
+    assert_eq!(skipper.position(), wide_varint.len());
+    assert_eq!(
+        reader(&wide_varint[1..]).read_i16(),
+        Err(ThriftError::VarintOverflow {
+            offset: 0,
+            target: VarintTarget::I16
+        })
+    );
+
+    // A bool element that is not 0, 1, or 2.
+    let mut bool_list = reader(&[0x11, 0x03]);
+    bool_list.skip(ElementType::List).unwrap();
+    assert_eq!(bool_list.position(), 2);
+
+    // Field ids are not computed, so a delta past i16::MAX is not an error.
+    let id_overflow = [0x05, 0xFE, 0xFF, 0x03, 0x00, 0x15, 0x00, 0x00];
+    let mut ids = reader(&id_overflow);
+    ids.skip(ElementType::Struct).unwrap();
+    assert_eq!(ids.position(), id_overflow.len());
+}
+
+#[test]
+fn skip_still_checks_structure() {
+    assert_eq!(
+        reader(&[0x1E]).skip(ElementType::Struct),
+        Err(ThriftError::InvalidType {
+            offset: 0,
+            code: 14
+        })
+    );
+    // A binary field claiming 5 bytes with 1 left.
+    assert!(matches!(
+        reader(&[0x18, 0x05, 0x00]).skip(ElementType::Struct),
+        Err(ThriftError::SizeExceedsInput { .. })
+    ));
+    // A varint that never terminates.
+    assert_eq!(
+        reader(&[0x80, 0x80]).skip(ElementType::I64),
+        Err(ThriftError::UnexpectedEof {
+            offset: 2,
+            needed: 1
+        })
+    );
+}
+
+#[test]
 fn empty_map_has_no_type_byte() {
     let mut r = reader(&[0x00, 0xAA]);
     r.skip(ElementType::Map).unwrap();
@@ -464,7 +534,7 @@ fn skipping_deep_nesting_stops_at_the_limit() {
     assert_eq!(
         reader(&deep).skip(ElementType::List),
         Err(ThriftError::DepthExceeded {
-            offset: depth,
+            offset: u32::from(MAX_SKIP_DEPTH),
             limit: MAX_SKIP_DEPTH
         })
     );

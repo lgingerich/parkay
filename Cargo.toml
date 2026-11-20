@@ -8,6 +8,11 @@ readme = "README.md"
 repository = "https://github.com/lgingerich/parkay"
 license = "MIT"
 
+[workspace]
+# The root package is the default member, so plain `cargo build`/`test`/`clippy` act on
+# parkay only. `bench-support` and `xtask` are development tooling.
+members = ["bench-support", "xtask"]
+
 [features]
 # Makes internal modules public (and hidden from docs) so the fuzz targets and
 # benchmarks, which build as separate crates, can call them. Not a stable API.
@@ -17,9 +22,23 @@ internals = []
 thiserror = "2.0.21"
 
 [dev-dependencies]
+bench-support = { path = "bench-support" }
 criterion = "0.8.2"
 parquet = "60.1.0"
 proptest = "1.12.0"
+
+[[bench]]
+name = "thrift"
+harness = false
+required-features = ["internals"]
+
+[[example]]
+name = "footer_stats"
+required-features = ["internals"]
+
+[[example]]
+name = "fuzz_corpus"
+required-features = ["internals"]
 
 [profile.release]
 codegen-units = 1
@@ -101,6 +120,9 @@ unused_dependencies             = "warn"
 [lints.clippy]
 pedantic                        = { level = "warn", priority = -2 }
 type_complexity                 = "allow"
+# Forced inlining is allowed, but every `#[inline]`, `#[inline(always)]`, and `#[cold]`
+# must be backed by a benchmark (see ARCHITECTURE.md, "Performance tooling").
+inline_always                   = "allow"
 
 # === Deny: unsafe code and pointers ===
 as_ptr_cast_mut                 = "deny"

@@ -1,0 +1,11 @@
+# Shared benchmark and profiling support: footer fixtures and a copy of arrow-rs's
+# Thrift reader for comparison. Not published; not part of parkay's API.
+[package]
+name = "bench-support"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT AND Apache-2.0"
+
+[dependencies]
+parquet = { version = "60.1.0", default-features = false }

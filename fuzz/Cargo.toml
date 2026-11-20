@@ -22,4 +22,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "thrift_consistency"
+path = "fuzz_targets/thrift_consistency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thrift_arrow_diff"
+path = "fuzz_targets/thrift_arrow_diff.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
