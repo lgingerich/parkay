@@ -11,6 +11,9 @@ license = "MIT"
 [dependencies]
 
 [dev-dependencies]
+criterion = "0.8.2"
+parquet = "60.1.0"
+proptest = "1.12.0"
 
 [profile.release]
 codegen-units = 1
