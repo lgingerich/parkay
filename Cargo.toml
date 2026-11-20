@@ -1,11 +1,11 @@
 [package]
-name = "rust-template"
+name = "parkay"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100.0"
-description = "TODO"
+description = "A high-performance Parquet reader and writer"
 readme = "README.md"
-repository = "TODO"
+repository = "https://github.com/lgingerich/parkay"
 license = "MIT"
 
 [dependencies]

@@ -1,17 +1,3 @@
-//! A strict Rust project template.
-
-/// Returns the crate name embedded by Cargo.
-#[must_use]
-pub fn crate_name() -> &'static str {
-    env!("CARGO_PKG_NAME")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn crate_name_matches_cargo_package_name() {
-        assert_eq!(crate_name(), env!("CARGO_PKG_NAME"));
-    }
-}
+//! A high-performance Parquet reader and writer.
+//!
+//! See `docs/design.md` for the design and `ARCHITECTURE.md` for module boundaries.

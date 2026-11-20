@@ -1,43 +1,25 @@
-# Rust Template
+# parkay
 
-A strict Rust project starter focused on safety, performance, and predictable tooling.
+A ground-up Rust implementation of a Parquet reader and writer, aimed at maximum
+performance. Early development: there is no functionality yet.
 
-## Included
+- Design: [`docs/design.md`](docs/design.md)
+- Module boundaries and invariants: [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- Contributor and agent workflow: [`AGENTS.md`](AGENTS.md)
 
-- Pinned stable Rust toolchain with `rustfmt` and `clippy`
-- Strict Rust, Clippy, and Cargo lint configuration; CI fails on any warning, including unused dependencies
-- Release, profiling, and development Cargo profiles
-- Stable `rustfmt.toml`
-- GitHub Actions CI for format, lint, docs, and test checks, with dependency caching
-- Dependabot updates for Cargo dependencies and GitHub Actions
-- A 3-day dependency cooldown: Cargo and Dependabot skip crate versions published in the last 3 days
-- Build caching via [`kache`](https://github.com/kunobi-ninja/kache), set as the `rustc-wrapper` in `.cargo/config.toml`
+## Setup
 
-## First Steps
+```bash
+git clone --recurse-submodules https://github.com/lgingerich/parkay
+# or, in an existing clone:
+git submodule update --init
+```
 
-1. Install the build cache wrapper:
-
-   ```bash
-   cargo install kache --locked
-   ```
-
-   `kache` is set as `rustc-wrapper` in `.cargo/config.toml`, so it must be on
-   `PATH` to build. To build without it, run `RUSTC_WRAPPER= cargo build`.
-
-2. Rename the package in `Cargo.toml`.
-3. Update `description` and `repository` in `Cargo.toml`. Keep the MIT license or
-   update both `license` and `LICENSE` to match your project's terms. Preserve
-   existing copyright notices on retained template material and add your own
-   for your contributions.
-4. Replace `src/lib.rs` with your project code.
-5. Run:
-
-   ```bash
-   cargo fmt
-   cargo clippy --all-targets --all-features
-   cargo test
-   ```
+Builds use [`kache`](https://github.com/kunobi-ninja/kache) as the `rustc-wrapper`
+(set in `.cargo/config.toml`). Install it with `cargo install kache --locked`, or
+build without it with `RUSTC_WRAPPER= cargo build`.
 
 ## License
 
-MIT. See [LICENSE](./LICENSE) for the full text.
+MIT. See [LICENSE](./LICENSE). `format/parquet.thrift` and the
+`testdata/parquet-testing` submodule are Apache-2.0, from the Apache Parquet project.
