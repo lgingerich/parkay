@@ -1,8 +1,10 @@
-//! Benchmarks for the Thrift compact-protocol reader over real and synthetic footers.
+//! Kernel benchmarks for the Thrift compact-protocol reader, over the footers and page
+//! indexes of the benchmark corpus (`bench-support/src/corpus.rs`).
 //!
-//! Run through `cargo xtask bench` (see `cargo xtask help`), or directly with
-//! `cargo bench --bench thrift --features internals`. Fixtures are in
-//! `bench-support/src/fixtures.rs`.
+//! These isolate the reader, which everything else is built on, so a small change in
+//! it shows here before it is diluted in `open`. They are not part of the default run:
+//! use `cargo xtask bench --bench thrift` when a profile points into the reader. Groups
+//! are named `thrift_ENTRY` and `thrift_ENTRY_page_index`.
 //!
 //! Set `PARKAY_BENCH_DIR` to a directory of Parquet files (or pass
 //! `cargo xtask bench --files DIR`) to add each file's footer and page index as
@@ -12,15 +14,19 @@
 //! Workloads, per fixture:
 //! - `skip`: skip the whole footer as one struct. The floor for opening a file in
 //!   parkay's lazy design, which walks the footer recording offsets.
+//! - `skip_marking`: `skip`, also recording which bits decided where each value ends.
+//!   Opening a file does this to the column chunks it later compares others with, so
+//!   its cost over `skip` is what a comparison that never matches wastes.
 //! - `arrow_skip`: the same with arrow-rs's reader (copied into `bench-support`).
-//!   The like-for-like comparison for `skip`.
+//!   The like-for-like comparison for `skip`. Omitted on `*_page_index` fixtures
+//!   because `ColumnIndex` begins with `list<bool> null_pages` and arrow-rs 60.1's
+//!   `skip` consumes no bytes for bool list elements.
 //! - `walk`: read every value with the `read_*` methods, without allocating. A proxy
 //!   for decoding everything.
-//! - `scan`: one pass touching every byte (counting bytes with the high bit set). The
-//!   floor for any parser that must look at each byte.
-//! - `memcpy`: copy the footer bytes. The memory-bandwidth floor.
-//! - `arrow_rs_decode`: arrow-rs's full metadata decode into owned structs. A
-//!   reference point only: it does more work than `skip` or `walk`.
+//! - `scan`: one compute-bound pass touching every byte. The floor for any parser that
+//!   must look at each byte, and the run's control for CPU clock drift.
+//! - `memcpy`: copy the footer bytes. The memory-bandwidth floor (saved with
+//!   `--reference`).
 
 #![expect(
     clippy::unwrap_used,
@@ -31,15 +37,28 @@ use std::hint::black_box;
 use std::path::Path;
 
 use bench_support::arrow_thrift::{self, ThriftCompactInputProtocol, ThriftSliceInputProtocol};
-use bench_support::fixtures::{self, Contents, Fixture};
+use bench_support::fixtures::{Contents, Fixture};
+use bench_support::{CONTROL_WORKLOAD, load_fixtures, run_control};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use parkay::thrift::{CompactReader, ElementType, FieldCursor, FieldType, ThriftError};
-use parquet::file::metadata::ParquetMetaDataReader;
+use parkay::thrift::{
+    CompactReader, ElementType, FieldCursor, FieldType, Marks, SKIP_DEPTH_MAX, ThriftError,
+};
 
-/// Reads every value in a value of type `ty`, returning a checksum so nothing is
-/// optimized away. Maps never occur in Parquet and are skipped.
-fn walk(reader: &mut CompactReader<'_>, ty: ElementType) -> Result<u64, ThriftError> {
-    Ok(match ty {
+/// Reads every value in a value of type `element_type`, returning a checksum so nothing is
+/// optimized away. Maps never occur in Parquet and are skipped. Nesting is bounded by
+/// `SKIP_DEPTH_MAX` so arbitrary `--files` inputs cannot overflow the stack.
+fn walk(
+    reader: &mut CompactReader<'_>,
+    element_type: ElementType,
+    depth: u16,
+) -> Result<u64, ThriftError> {
+    if depth >= SKIP_DEPTH_MAX {
+        return Err(ThriftError::DepthExceeded {
+            offset: u32::try_from(reader.position()).unwrap_or(u32::MAX),
+            limit: SKIP_DEPTH_MAX,
+        });
+    }
+    Ok(match element_type {
         ElementType::Bool => u64::from(reader.read_bool_element()?),
         ElementType::I8 => u64::from(reader.read_i8()?.cast_unsigned()),
         ElementType::I16 => u64::from(reader.read_i16()?.cast_unsigned()),
@@ -51,7 +70,7 @@ fn walk(reader: &mut CompactReader<'_>, ty: ElementType) -> Result<u64, ThriftEr
             let header = reader.read_list_header()?;
             let mut sum = 0_u64;
             for _ in 0..header.size() {
-                sum = sum.wrapping_add(walk(reader, header.element_type())?);
+                sum = sum.wrapping_add(walk(reader, header.element_type(), depth + 1)?);
             }
             sum
         }
@@ -59,21 +78,9 @@ fn walk(reader: &mut CompactReader<'_>, ty: ElementType) -> Result<u64, ThriftEr
             let mut sum = 0_u64;
             let mut fields = FieldCursor::default();
             while let Some(field) = fields.next(reader)? {
-                let value = match field.ty() {
-                    FieldType::Bool(b) => u64::from(b),
-                    FieldType::I8 => walk(reader, ElementType::I8)?,
-                    FieldType::I16 => walk(reader, ElementType::I16)?,
-                    FieldType::I32 => walk(reader, ElementType::I32)?,
-                    FieldType::I64 => walk(reader, ElementType::I64)?,
-                    FieldType::Double => walk(reader, ElementType::Double)?,
-                    FieldType::Binary => walk(reader, ElementType::Binary)?,
-                    FieldType::List => walk(reader, ElementType::List)?,
-                    FieldType::Set => walk(reader, ElementType::Set)?,
-                    FieldType::Struct => walk(reader, ElementType::Struct)?,
-                    other => {
-                        reader.skip_field(other)?;
-                        0
-                    }
+                let value = match field.field_type().element_type() {
+                    Some(element) => walk(reader, element, depth + 1)?,
+                    None => u64::from(matches!(field.field_type(), FieldType::Bool(true))),
                 };
                 sum = sum
                     .wrapping_add(value)
@@ -82,7 +89,7 @@ fn walk(reader: &mut CompactReader<'_>, ty: ElementType) -> Result<u64, ThriftEr
             sum
         }
         ElementType::Map | ElementType::Uuid => {
-            reader.skip(ty)?;
+            reader.skip(element_type)?;
             0
         }
     })
@@ -90,9 +97,20 @@ fn walk(reader: &mut CompactReader<'_>, ty: ElementType) -> Result<u64, ThriftEr
 
 /// Skips structs until the buffer ends: one for a footer, many for a page index.
 fn skip_footer(footer: &[u8]) -> usize {
-    let mut reader = CompactReader::new(footer);
+    let mut reader = CompactReader::new(footer, 0);
     while reader.position() < footer.len() {
         reader.skip(ElementType::Struct).unwrap();
+    }
+    reader.position()
+}
+
+/// [`skip_footer`], marking. The marks are reused, as the pass that opens a file
+/// reuses them from one column chunk to the next.
+fn skip_marking_footer(footer: &[u8], marks: &mut Marks) -> usize {
+    marks.clear();
+    let mut reader = CompactReader::new(footer, 0);
+    while reader.position() < footer.len() {
+        reader.skip_marking(ElementType::Struct, marks).unwrap();
     }
     reader.position()
 }
@@ -106,16 +124,12 @@ fn arrow_skip_footer(footer: &[u8]) -> usize {
 }
 
 fn walk_footer(footer: &[u8]) -> u64 {
-    let mut reader = CompactReader::new(footer);
+    let mut reader = CompactReader::new(footer, 0);
     let mut sum = 0_u64;
     while reader.position() < footer.len() {
-        sum = sum.wrapping_add(walk(&mut reader, ElementType::Struct).unwrap());
+        sum = sum.wrapping_add(walk(&mut reader, ElementType::Struct, 0).unwrap());
     }
     sum
-}
-
-fn scan_footer(footer: &[u8]) -> usize {
-    footer.iter().filter(|&&byte| byte & 0x80 != 0).count()
 }
 
 /// Runs `f` over every footer of the fixture.
@@ -126,41 +140,46 @@ fn each<T>(fixture: &Fixture, f: impl Fn(&[u8]) -> T) {
 }
 
 fn bench_fixture(c: &mut Criterion, fixture: &Fixture) {
-    let mut group = c.benchmark_group(&fixture.name);
+    let mut group = c.benchmark_group(format!("thrift_{}", fixture.name));
     group.throughput(Throughput::Bytes(fixture.bytes() as u64));
     group.bench_function("skip", |b| b.iter(|| each(fixture, skip_footer)));
-    group.bench_function("arrow_skip", |b| {
-        b.iter(|| each(fixture, arrow_skip_footer));
+    group.bench_function("skip_marking", |b| {
+        let mut marks = Marks::new();
+        b.iter(|| {
+            for footer in &fixture.footers {
+                black_box(skip_marking_footer(black_box(footer), &mut marks));
+            }
+            black_box(&marks);
+        });
     });
+    // The reference: run by `cargo xtask bench --bench thrift --reference`.
+    // Skipped on page indexes: `ColumnIndex` starts with `list<bool> null_pages`, and
+    // arrow-rs 60.1's `skip` consumes 0 bytes for bool list elements (so it misparses
+    // single-page indexes via a cold fallback and panics on multi-page ones).
+    if fixture.contents != Contents::PageIndex {
+        group.bench_function("arrow_skip", |b| {
+            b.iter(|| each(fixture, arrow_skip_footer));
+        });
+    }
     group.bench_function("walk", |b| b.iter(|| each(fixture, walk_footer)));
-    group.bench_function("scan", |b| b.iter(|| each(fixture, scan_footer)));
-    let mut scratch: Vec<Vec<u8>> = fixture.footers.iter().map(|f| vec![0; f.len()]).collect();
+    group.bench_function(CONTROL_WORKLOAD, |b| {
+        b.iter(|| run_control(&fixture.footers));
+    });
     group.bench_function("memcpy", |b| {
+        let mut scratch: Vec<Vec<u8>> = fixture.footers.iter().map(|f| vec![0; f.len()]).collect();
         b.iter(|| {
             for (dst, src) in scratch.iter_mut().zip(&fixture.footers) {
                 dst.copy_from_slice(black_box(src));
-                black_box(&dst);
+                black_box(dst.as_slice());
             }
         });
     });
-    if fixture.contents == Contents::Footer {
-        group.bench_function("arrow_rs_decode", |b| {
-            b.iter(|| {
-                each(fixture, |footer| {
-                    ParquetMetaDataReader::decode_metadata(footer).unwrap()
-                });
-            });
-        });
-    }
     group.finish();
 }
 
 fn benches(c: &mut Criterion) {
     let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
-    let mut all = fixtures::all(&testdata);
-    if let Some(dir) = std::env::var_os("PARKAY_BENCH_DIR") {
-        all.extend(fixtures::from_dir(Path::new(&dir)));
-    }
+    let all = load_fixtures(&testdata);
     for fixture in &all {
         bench_fixture(c, fixture);
     }

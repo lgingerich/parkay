@@ -13,18 +13,18 @@ use libfuzzer_sys::fuzz_target;
 use parkay::thrift::CompactReader;
 
 fuzz_target!(|data: &[u8]| {
-    let Some((ty, input)) = common::split(data) else {
+    let Some((element_type, input)) = common::split(data) else {
         return;
     };
-    let mut decoded = CompactReader::new(input);
-    let walked = common::walk(&mut decoded, ty, 0);
+    let mut decoded = CompactReader::new(input, 0);
+    let walked = common::walk(&mut decoded, element_type, 0);
     assert!(decoded.position() <= input.len());
 
-    let mut skipped = CompactReader::new(input);
-    let skip = skipped.skip(ty);
+    let mut skipped = CompactReader::new(input, 0);
+    let skip = skipped.skip(element_type);
     assert!(skipped.position() <= input.len());
 
-    if walked.is_ok() {
+    if walked.is_some() {
         assert_eq!(skip, Ok(()), "read API accepted what skip rejected");
         assert_eq!(
             skipped.position(),

@@ -7,6 +7,10 @@
 
 #![no_main]
 
+#[expect(
+    dead_code,
+    reason = "reuses arrow-rs Thrift decoder copy from bench-support"
+)]
 #[path = "../../bench-support/src/arrow_thrift.rs"]
 mod arrow_thrift;
 mod common;
@@ -15,8 +19,8 @@ use arrow_thrift::{FieldType, ThriftCompactInputProtocol, ThriftSliceInputProtoc
 use libfuzzer_sys::fuzz_target;
 use parkay::thrift::{CompactReader, ElementType};
 
-fn arrow_type(ty: ElementType) -> FieldType {
-    match ty {
+fn arrow_type(element_type: ElementType) -> FieldType {
+    match element_type {
         ElementType::Bool => FieldType::BooleanTrue,
         ElementType::I8 => FieldType::Byte,
         ElementType::I16 => FieldType::I16,
@@ -33,15 +37,15 @@ fn arrow_type(ty: ElementType) -> FieldType {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((ty, input)) = common::split(data) else {
+    let Some((element_type, input)) = common::split(data) else {
         return;
     };
-    let mut ours = CompactReader::new(input);
-    if ours.skip(ty).is_err() || !common::arrow_comparable(input, ty) {
+    let mut ours = CompactReader::new(input, 0);
+    if ours.skip(element_type).is_err() || !common::arrow_comparable(input, element_type) {
         return;
     }
     let mut theirs = ThriftSliceInputProtocol::new(input);
-    if theirs.skip(arrow_type(ty)).is_ok() {
+    if theirs.skip(arrow_type(element_type)).is_ok() {
         let theirs_end = input.len() - theirs.as_slice().len();
         assert_eq!(
             ours.position(),

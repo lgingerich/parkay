@@ -24,7 +24,7 @@ thiserror = "2.0.21"
 [dev-dependencies]
 bench-support = { path = "bench-support" }
 criterion = "0.8.2"
-parquet = "60.1.0"
+parquet = { version = "60.1.0", default-features = false }
 proptest = "1.12.0"
 
 [[bench]]
@@ -32,12 +32,12 @@ name = "thrift"
 harness = false
 required-features = ["internals"]
 
-[[example]]
-name = "footer_stats"
-required-features = ["internals"]
+[[bench]]
+name = "metadata"
+harness = false
 
 [[example]]
-name = "fuzz_corpus"
+name = "footer_stats"
 required-features = ["internals"]
 
 [profile.release]
@@ -69,10 +69,16 @@ strip = false
 [profile.dev.package."*"]
 debug = false
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 # Levels: `deny` fails every build, for code that is unsound or definitely wrong.
 # `warn` lets local builds continue; CI sets CARGO_BUILD_WARNINGS=deny, so every
 # warning must be fixed before merge.
+# Library-only lints (`missing_docs`, `missing_debug_implementations`, `unnameable_types`,
+# `unreachable_pub`) and `print_stdout`/`print_stderr` live on `src/lib.rs` so `xtask`,
+# `bench-support`, and `examples/` share this table without duplication.
 
 # === Deny: unsound or definitely wrong ===
 ambiguous_negative_literals     = "deny"
@@ -101,12 +107,6 @@ unused_mut                      = "warn"
 unused_qualifications           = "warn"
 unused_variables                = "warn"
 
-# === Public API and docs ===
-missing_debug_implementations   = "warn"
-missing_docs                    = "warn"
-unnameable_types                = "warn"
-unreachable_pub                 = "warn"
-
 # === Clarity ===
 elided_lifetimes_in_paths       = "warn"
 explicit_outlives_requirements  = "warn"
@@ -114,10 +114,10 @@ impl_trait_redundant_captures   = "warn"
 trivial_casts                   = "warn"
 trivial_numeric_casts           = "warn"
 
-[lints.cargo]
+[workspace.lints.cargo]
 unused_dependencies             = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic                        = { level = "warn", priority = -2 }
 type_complexity                 = "allow"
 # Forced inlining is allowed, but every `#[inline]`, `#[inline(always)]`, and `#[cold]`
@@ -173,8 +173,6 @@ while_float                     = "warn"
 dbg_macro                       = "warn"
 exit                            = "warn"
 expect_used                     = "warn"
-print_stderr                    = "warn"
-print_stdout                    = "warn"
 todo                            = "warn"
 unimplemented                   = "warn"
 unwrap_used                     = "warn"
@@ -222,7 +220,6 @@ as_underscore                   = "warn"
 assertions_on_result_states     = "warn"
 clone_on_copy                   = "warn"
 clone_on_ref_ptr                = "warn"
-cognitive_complexity            = "warn"
 derivable_impls                 = "warn"
 derive_partial_eq_without_eq    = "warn"
 empty_drop                      = "warn"

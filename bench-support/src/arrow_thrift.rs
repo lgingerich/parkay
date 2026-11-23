@@ -23,7 +23,12 @@
 // - the I/O and UTF-8 error variants, and the methods that need `ParquetError`
 //   (`read_bytes_owned`, `read_string`, `skip_empty_struct`), are removed.
 
-#![allow(clippy::all, missing_docs, dead_code)]
+#![expect(
+    clippy::pedantic,
+    clippy::as_underscore,
+    clippy::shadow_unrelated,
+    reason = "copied verbatim from arrow-rs parquet 60.1.0"
+)]
 
 use std::num::TryFromIntError;
 

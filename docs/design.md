@@ -1,9 +1,30 @@
 # Parkay design
 
-Status: living document, last reviewed 2026-11-20. It records the design direction
-agreed so far and what has been built (section 13). It describes intent, not
-measured results: every performance expectation in it is a hypothesis until a
-benchmark confirms it, and measurements are logged in `docs/perf/`, not here.
+Status: living document, last reviewed 2026-11-23. It records the decisions that
+shape every phase and what has been built (section 13). Detail that belongs to
+one phase is in `docs/design-notes.md`: the metadata design as built in M2, and
+working notes for the phases not yet started. Those notes are settled only when
+their phase starts, because building the earlier phases will change them. This
+document describes intent, not measured results: every performance expectation
+in it is a hypothesis until a benchmark confirms it, and measurements are logged
+in `docs/perf/`, not here.
+
+## Contents
+
+- [1. Purpose](#1-purpose)
+- [2. Goals and non-goals](#2-goals-and-non-goals)
+- [3. Architecture](#3-architecture)
+- [4. Kernels](#4-kernels)
+- [5. Reader](#5-reader)
+- [6. Writer](#6-writer)
+- [7. Reference scanner](#7-reference-scanner)
+- [8. Integrations](#8-integrations)
+- [9. Format scope](#9-format-scope)
+- [10. Safety and correctness](#10-safety-and-correctness)
+- [11. Benchmarking](#11-benchmarking)
+- [12. Decisions against and deferrals](#12-decisions-against-and-deferrals)
+- [13. Order of work](#13-order-of-work)
+- [14. Open questions](#14-open-questions)
 
 ## 1. Purpose
 
@@ -16,6 +37,15 @@ physical limit applies: memory bandwidth, the throughput of the compression
 codec, or the storage or network link. The implementation is optimal when that
 limit, and not Parquet framing, decoding, allocation, or scheduling, is what
 bounds throughput.
+
+Parkay borrows from Tiger Style, TigerBeetle's coding style; the parts it takes,
+adapted to Rust, are in `AGENTS.md`. Performance is the goal, and it is what
+Parkay will be judged on. Safety is the constraint performance may not break:
+Parkay never returns or writes wrong data, never panics or exceeds its limits
+because of what a file contains, and uses no `unsafe` without sign-off. Where
+the two pull apart, the design looks for the form that costs nothing in a
+release build, such as checks that run only in tests and fuzzing, before it
+gives up either. Developer experience comes after both.
 
 Three ideas follow from that definition and shape most of the design:
 
@@ -73,8 +103,8 @@ The scanner and the adapters sit on top of it.
 |  Reference scanner: thread pool, file I/O, scan planning  |
 +-----------------------------------------------------------+
 |  Core (sans-I/O)                                          |
-|    metadata | page framing | reader and writer state      |
-|    machines | pruning | selection | encoded-form API      |
+|    metadata | page framing | reader and writer steps      |
+|    pruning | selection | encoded-form API                 |
 +-----------------------------------------------------------+
 |  Kernels: unpack, pack, gather, compress, expand, delta,  |
 |  byte-stream-split, levels, statistics, codec wrappers    |
@@ -109,9 +139,9 @@ that needs it is written; none of those in the table below is a dependency yet.
 
 | Need | Choice | Basis |
 |---|---|---|
-| SIMD | `fearless_simd` | Chosen directly; covers dispatch, portable vectors, and safe intrinsics |
+| SIMD | `fearless_simd` | Chosen directly; intended to cover dispatch, portable vectors, and safe intrinsics (capabilities to be verified in step 2; see section 14) |
 | Zstd | `zrip` | Faster than the C library on decode, roughly level on encode, and no `unsafe` in its own code. It is a young crate, so the C library stays in the differential tests as a reference |
-| Snappy | `snap` | The C++ library was moderately faster, but needs a vendored build and puts untrusted input through C++. To be revisited if profiles show Snappy decode matters |
+| Snappy | `snap` | The C++ library was moderately faster, but needs a vendored build and puts untrusted input through C++. Note: `snap` has no `[MaybeUninit<u8>]` API (so decompression writes into a reused initialized slice). To be revisited if profiles show Snappy decode matters |
 | LZ4 | `lz4_flex`, safe mode | Close to the C library, with no `unsafe` |
 | UTF-8 validation | `simdutf8` | Level with the C++ library and several times faster than the standard library in bulk |
 | Dictionary hashing | `foldhash` with `hashbrown` | Fastest or level on real columns, and robust on adversarial integer patterns where simpler hashes collapsed |
@@ -130,17 +160,62 @@ tests, and fixture generation), and `libfuzzer-sys` in the fuzz crate.
 
 ### The core is sans-I/O
 
-The core never performs I/O and never spawns threads. It is a set of state
-machines over byte slices:
+The core never performs I/O and never spawns threads. It is a set of steps over
+plain data: opening a file, deciding which byte ranges and rows a scan needs,
+and decoding. Each step is a function that takes the bytes and the state it
+needs and returns either its result or the byte ranges it is missing.
 
-- The caller supplies bytes and asks what to do next.
-- The core answers with either decoded output, a request for specific byte
-  ranges, or a unit of work that can be executed on any thread.
-- All policy about where bytes come from and which thread runs what belongs to
-  the layer above.
+- **Steps return; they do not wait or call back for bytes.** "More bytes
+  needed" is an ordinary result that names every range the step can already
+  determine. The caller fetches them and calls the step again. A step runs to
+  completion each time it is called.
+- **State is plain data.** What persists between calls (metadata, the outcome of
+  pruning, the position of a column being decoded) holds no borrow of the
+  caller's bytes, no shared pointer, and no interior mutability. It can be moved
+  between threads, stored in a cache, or kept inside an async task without
+  lifetime constraints.
+- **Memory arrives as arguments.** Every call receives the input bytes, with
+  their position in the file, and every buffer it reads or writes. Who owns that
+  memory is set out under "Caller-owned memory".
+- **Sequencing belongs to the layer above**: which row group comes next, how far
+  ahead to fetch, what runs in parallel, and where bytes come from. The core has
+  no driver loop of its own. A convenience driver for simple callers can be
+  built on the steps; it is not part of the core.
+- **A unit of work is a description**, not a closure: plain data naming what to
+  decode. Whoever runs it supplies the bytes and buffers at that moment, on any
+  thread.
 
 This keeps the core usable from a synchronous program, an async runtime, or an
-engine with its own scheduler, and it makes the core straightforward to fuzz.
+engine with its own scheduler. It also makes every step a function of its inputs
+alone, which is what makes the core straightforward to test and to fuzz.
+
+### Control plane and data plane
+
+Work in the core is of two kinds, and the rules differ between them.
+
+- The **control plane** decides. It opens a file, prunes, and sets up a column
+  chunk or a page, and it runs once per file, row group, column chunk, or page.
+- The **data plane** moves values. It is the kernels and the loops directly
+  around them, and it runs once per block of values.
+
+| | Control plane | Data plane |
+|---|---|---|
+| Allocation | Allowed, bounded by a limit or by the size of the input | None |
+| Errors | Typed, naming the position and the structure concerned | None by construction, or a small `Copy` value |
+| Assertions | In debug builds, tests, and fuzzing; in release builds only for a check that runs once per page or less often | In debug builds, tests, and fuzzing only, unless a measurement shows a check on entry to a kernel is free |
+| Branching | Free to branch and to dispatch dynamically | Decided before the loop, not inside it |
+
+The split is what lets the control plane check everything without the data
+plane paying for it. A kernel receives input that has already been validated,
+in batches large enough that the checks around it are amortized.
+
+Errors follow the same split. A function called from a hot loop, whether per
+value, per block, or per column chunk of a wide footer, returns no error where
+its inputs can be validated beforehand. Where it must return one, the error is
+`Copy` and stays within two machine words, held there by a compile-time
+assertion, as the Thrift error is. The context a caller needs (the position in
+the file, the row group, the column, the page) is added once, where the error
+crosses into the control plane.
 
 ### Access patterns: round trips over bytes
 
@@ -166,22 +241,46 @@ either fast:
 
 ### Caller-owned memory
 
-Decode and encode entry points write into buffers the caller provides. The core
-keeps reusable scratch state (decompression buffers, codec contexts,
-intermediate blocks) in an explicit per-worker object that the caller creates
-once and passes in, not in thread-local storage. In steady state the read path
-should perform no heap allocation.
+The core's own values own no large memory. Everything a decode or encode call
+reads or writes is created by the caller and passed in. There are four kinds:
+
+- **Input bytes.** The caller's fetch buffers, borrowed for the length of one
+  call and addressed by their offset in the file. The caller can reuse them from
+  file to file.
+- **Column buffers.** One set for each column being read: the decompressed page
+  and the decoded dictionary. A column that is part of the way through a page
+  keeps that page between calls, so these belong to the column and not to the
+  worker. They are reused from page to page and from one column chunk to the
+  next.
+- **The worker context.** One per thread, created once and passed explicitly,
+  not kept in thread-local storage. It holds the codec contexts, the block-sized
+  intermediates the kernels use, the kernels chosen for this CPU, and the
+  counters described below. It has a fixed size, is fully allocated when it is
+  created, and does not grow.
+- **Output buffers.** Decode and encode entry points write into buffers the
+  caller provides.
+
+No call on the data plane allocates. A column buffer grows only on the control
+plane, when a page or a dictionary is larger than any before it, and only up to
+a limit (section 10). In steady state the read path performs no heap allocation
+of its own. Where a dependency allocates internally, as a codec may, that is
+recorded as an exception.
+
+The worker context carries plain integer counters for the work done with it,
+such as bytes decompressed, pages decoded and skipped, and rows decoded and
+skipped, and rows in and out for each predicate. They are incremented where the
+work happens, and the layer above reads and sums them across workers. There are
+no global or atomic counters.
 
 Scratch buffers avoid needless zero-filling before being overwritten.
 
-Scratch memory is reused from one page to the next, so nothing the caller keeps
+The page buffer is reused from one page to the next, so nothing the caller keeps
 may point into it. Output the caller keeps is always copied or decoded into
-caller-owned buffers. The one thing that may reference scratch memory is an
-encoded block, which is a short-lived borrow from the reader: the borrow must
-end before the reader can advance, and the compiler enforces that. Output that
-references decompressed page bytes and outlives the page would require keeping
-each page's buffer alive for as long as the output exists, which is a different
-buffering model; it is deferred (see "Output forms").
+caller-owned buffers. The one thing that may reference the page buffer is an
+encoded block, which is a short-lived borrow: the borrow must end before the
+column is advanced again, and the compiler enforces that. Output that references
+decompressed page bytes and outlives the page needs a different buffering model,
+and is deferred (section 12).
 
 ## 4. Kernels
 
@@ -196,12 +295,37 @@ place them in the output.
 At the start of each page (and at each change of run or miniblock inside a
 page), the reader resolves the stages it needs into a pipeline of specialized
 kernels. Kernels are monomorphized ahead of time over the properties that
-matter, such as bit width and value type, and selected through a dispatch table.
+matter, such as bit width and physical byte width (converting only where
+representations differ), and selected through a dispatch table.
 Nothing is generated at run time.
 
 Pages are decompressed and decoded one at a time, so decompressed bytes are
 consumed while still cache-resident, and the scratch buffer is reused for the
 next page.
+
+### Decoders, the column reader, and kernels
+
+Decoding a column has three kinds of code, and the branching lives in one of
+them.
+
+- A **decoder** reads one encoding. It is plain state: a position in the page
+  and whatever the encoding carries from one value to the next. It offers a
+  small fixed set of operations: skip some values; decode some values densely
+  into a slice; and, for the run-length and bit-packed hybrid only, report the
+  next run or packed group without expanding it. A decoder knows nothing about
+  nulls, selections, predicates, or output types.
+- The **column reader** is one function per column, and it holds all the
+  branching. For the next block of rows it reads the levels and the selection,
+  works out how many values to skip and how many to decode, chooses the kernels,
+  and calls them. Every decision about encoding, nulls, selection, and output form is made
+  here, once per block or per run, never inside a loop over values.
+- A **kernel** is a loop over slices with no decisions in it: unpack, gather,
+  compare, compress, expand, convert. Kernels are free functions that take
+  slices and integers. They are not methods on a decoder or on the column
+  reader.
+
+A value is written to its final place once. Why this shape was chosen over
+decoders that push values into a generic consumer is in `docs/design-notes.md`.
 
 ### SIMD strategy
 
@@ -216,24 +340,18 @@ Parkay uses both autovectorization and explicit SIMD, under one rule:
 3. Explicit intrinsics are written only for kernels where measurement shows the
    compiler's output falls meaningfully short of the hardware limit.
 
-Kernels expected to need explicit SIMD include bit-unpacking and bit-packing
-(Parquet's sequential packing layout vectorizes poorly on its own), compress and
-expand operations for nulls and selections, delta prefix sums, conversion of
-levels to bitmasks, and possibly dictionary gathers and byte-stream-split.
-Element-wise comparisons, simple copies, and integer statistics are expected to
-autovectorize acceptably.
-
-SIMD code is written with the `fearless_simd` crate. It provides the three
-layers this strategy needs: multiversioned autovectorization of scalar code with
-runtime dispatch, portable vector types that are generic over the instruction
-set (including compress, expand, per-lane shifts, byte shuffles, and bitmask
-conversion), and safe access to raw intrinsics for operations the portable API
-does not cover, such as gathers. Kernels use the highest layer that reaches the
+SIMD code is intended to use `fearless_simd` to supply the three layers this
+strategy needs: multiversioned autovectorization of scalar code with runtime
+dispatch, portable vector types generic over the instruction set (for per-lane
+shifts, byte shuffles, bitmask conversion, and compress/expand where supported),
+and safe access to raw intrinsics for operations the portable API does not cover
+(such as gathers, if measurement favors them over scalar loads). Which of these
+operations `fearless_simd` exposes safely is to be verified when the first SIMD
+kernels are written (section 14). Kernels use the highest layer that reaches the
 hardware limit and drop to a lower one only on evidence.
 
 UTF-8 validation, checksums, compression codecs, and hashing use existing
-crates. Each is chosen by a benchmark comparison of the candidates on
-Parquet-shaped inputs, not by assumption.
+crates, each chosen by a benchmark comparison on Parquet-shaped inputs.
 
 Supported instruction sets are NEON on AArch64 and AVX2 on x86-64 as first-class
 targets. AVX-512 is an additional tier. No design element may depend on an
@@ -258,86 +376,39 @@ intermediate block. The policy is:
   run and page boundaries. Instantiations are therefore added individually, on
   evidence.
 
-Candidates to evaluate first: unpack plus compare-to-bitmask, unpack plus
-dictionary gather for fixed-width values, and encode plus statistics in the
-writer.
-
-The decision on how far to take fusion is made by experiment: once the composed
-pipeline exists, a few representative fused kernels are written by hand and
-compared against it.
+How far to take fusion is decided by experiment: once the composed pipeline
+exists, a few representative fused kernels are written by hand and compared
+against it.
 
 ## 5. Reader
 
 ### Metadata
 
-- The footer is not eagerly deserialized into an owned tree. One pass over the
-  footer records where each row group and column chunk begins; details are
-  decoded on demand for the columns and row groups actually requested.
-- Parsed metadata can be retained and reused by the caller across reads of the
-  same file, and the API allows a caller to supply previously obtained metadata
-  so a file can be opened without re-reading the footer.
-- Opening a file starts from whatever tail of the file the caller supplies. If the
-  footer, and the page index in front of it, are already in those bytes, opening
-  needs no further request. Otherwise the core reports exactly what is missing.
-- Lazy decoding saves CPU and memory, not round trips. On object storage, the
-  number of dependent requests to open a file matters more than footer parse time;
-  on local storage and for cached metadata, parse time is what remains.
-- Retained metadata is a natural unit for a cache in the layer above, for example
-  keyed by path and object version, and possibly shared across concurrent scans.
-  Its form (the retained footer bytes plus an index into them) should stay cheap
-  to keep and share.
+Built in M2. The full design, with its acceptance targets and the rules for
+malformed footers, is in `docs/design-notes.md`. The decisions that shape what
+comes after it:
 
-#### The Thrift layer
-
-Footer and page-header metadata is Thrift compact protocol. Parkay has its own
-reader for it, because the alternatives do not fit the lazy design: the general
-`thrift` crate decodes everything into owned structures, and arrow-rs's custom
-parser is private to that crate. The reader:
-
-- Works on a borrowed byte slice, allocates nothing, and borrows binary values
-  from the input.
-- Knows nothing about Parquet's structures. It imports nothing else from the
-  crate, so it could become its own crate unchanged.
-- Offers two ways over a value: the read methods, which decode and validate it,
-  and `skip`, which passes over it. Skipping validates structure (type codes,
-  sizes against the remaining input, nesting depth) but not the values it
-  discards, such as integer widths. A value skipped at open can still fail when
-  it is later decoded.
-- Accepts the legacy and non-conforming output that real writers produce, such as
-  fastparquet's empty lists with element type 0 and the older `0` for false in
-  bool lists, and rejects anything else malformed.
-- Reports every error with the byte offset of the bad value, in an error type kept
-  small because every read returns it.
-
-Skipping is the main cost of opening a file in the lazy design, so its
-performance is tracked in `docs/perf/thrift-skip.md`. Its hot loop has proved
-sensitive to small changes and to the shape of the input, so changes there are
-checked on more than one kind of footer and in the generated assembly.
-
-#### Decoding metadata structures
-
-Direction for the decoders that turn requested parts of the footer into Parkay's
-types, informed by arrow-rs's custom Thrift parser (its
-[announcement](https://arrow.apache.org/blog/2025/10/23/rust-parquet-metadata/) and
-the pull requests it cites). There, building and freeing owned structures, not the
-Thrift protocol itself, dominated parse time.
-
-- Decode directly into the final types, with no intermediate layer of generic
-  Thrift structs to convert from.
-- Prefer compact representations over many small allocations: for example a
-  bitmask for a column chunk's encodings, counts rather than lists for page
-  encoding statistics, and strings borrowed from the retained footer bytes rather
-  than copied.
-- Track which required fields were seen with a small bitmask and fill structures
-  in place, rather than collecting optional locals and checking them at the end.
-- Keep field-header reading inlined into the hot decoders, as the skip path does.
-- Match each field on both its id and its wire type, so a field with the expected
-  id but an unexpected type is never misread.
-- The hot structures (row group, column chunk, column metadata, page header) are
-  hand-written. Whether the long tail of simpler structures is generated by a
-  declarative macro is decided once a few decoders exist and the repetition is
-  visible. A macro mainly helps keep decoders faithful to the pinned
-  `parquet.thrift`.
+- **Lazy.** The footer is not deserialized into an owned tree. One pass records
+  where each row group and column chunk begins, the **footer directory**, and
+  details are decoded on demand for the columns and row groups requested.
+  Thrift has no length prefixes on structs, so that pass still reads every
+  footer byte; most column chunks are passed over by comparing them with an
+  earlier chunk of the same column instead of parsing them.
+- **Opening is one step.** It takes any tail of the file, the file's length,
+  and the limits, and returns the metadata or the range that is missing. Lazy
+  decoding saves CPU and memory, not round trips.
+- **Late errors.** Column-chunk details are skipped at open, and skipping checks
+  structure, not values, so a file can open and fail when a chunk is first
+  decoded. That is the documented contract.
+- **Parkay copies the footer** into exact-size storage it owns
+  (`docs/perf/footer-ownership.md`). The retained metadata is plain, immutable,
+  and shareable, borrows nothing from its own bytes, and caches nothing
+  decoded. Decoders take the few values they need and do not borrow it.
+- **The schema is a separate value**, reusable across files of one dataset.
+- **Extraction is the one way to read column-chunk facts**, into arrays the
+  caller owns, indexed by row group and column.
+- **Parkay has its own Thrift reader**, over a borrowed slice, with no knowledge
+  of Parquet's structures.
 
 ### Pruning and skipping
 
@@ -350,6 +421,11 @@ The cheapest page is the one never fetched. The reader uses, in order of cost:
 The result is a plan of byte ranges to fetch and a row selection to apply. Pages
 excluded by the plan are neither read nor decompressed.
 
+Pruning on statistics that are wrong or misread drops rows that match, and the
+result is silently wrong, not an error. Statistics are used only where the
+format and the writer make them trustworthy, and when in doubt the reader does
+not prune. The rules are in `docs/design-notes.md`.
+
 ### Predicates
 
 The core accepts a closed set of single-column predicates: comparison with a
@@ -358,7 +434,9 @@ be evaluated against statistics, Bloom filters, dictionaries, and encoded data.
 
 Anything more general is evaluated by the caller, using either the
 block-synchronous scan described below or its own machinery over the decoded
-output.
+output. In what order predicates on different columns are evaluated is a choice
+across the scan, so it belongs to the layer above; the core reports what that
+choice needs in the worker counters (section 3).
 
 ### Selection-aware decoding
 
@@ -368,9 +446,11 @@ output.
 - Predicates on run-length-encoded data are evaluated once per run.
 - Filter columns are decoded first and produce a row selection. Other columns
   are then decoded only at the selected positions.
-- The decode strategy for each page is chosen from the density of the selection
-  over that page: sparse selections use skipping kernels, dense selections use a
-  full decode followed by compaction. No history or estimator is involved.
+- The decode strategy for each page is chosen from the selection over that page
+  alone, using both selection density and run count (computed in one pass over
+  the bitmask): sparse selections with few runs use skipping kernels, dense or
+  highly fragmented selections use a full decode followed by compaction. No
+  history or estimator is involved.
 - Row selections have one in-memory representation in the first version, a
   bitmask. Whole pages excluded by pruning are dropped from the plan and never
   appear in it. A range-based representation for very sparse selections is
@@ -378,63 +458,48 @@ output.
 
 ### Output forms
 
-The reader returns a column at three levels, all supported from the first
-version. They are layers of one decode path, not three implementations: encoded
-blocks are the base, and each higher level is built by consuming the one below.
+The reader is structured around three output levels — choices the column reader
+makes over the same decoders and kernels (section 4), not three implementations,
+and not layers that hand decoded blocks to one another. Dictionary-preserved and
+materialized output are public from the first version; whether encoded blocks are
+also exposed publicly in the first version or remain an internal base layer until
+a consumer needs them is an open question (section 14).
 
-1. **Encoded blocks**, the lowest level. The caller receives the data as the
-   file stores it: a stream of blocks that are each a run (a value or code and
-   a length), a bit-packed group with its bit width, or a slice of plain
-   values, together with the dictionary where one applies and the validity for
-   the block. Nothing is expanded.
-   - This is a block-oriented interface, not a callback per run, because
-     Parquet's hybrid encoding alternates short packed groups with runs.
-   - A block borrows from the reader and is valid only until the reader
-     advances. The caller consumes or copies it before asking for the next one.
-   - Callers must expect the encoding to change between pages and dictionaries
-     to differ between column chunks.
-   - Encodings with no useful compressed-domain form, such as the delta
-     encodings and byte-stream-split, are delivered as blocks of decoded
-     values.
+1. **Encoded blocks**, the lowest level: runs, bit-packed groups, and slices of
+   plain values as the file stores them, with the dictionary and the validity.
+   A block borrows from the reader and is valid only until the reader advances.
+   Encodings with no useful compressed-domain form are delivered as blocks of
+   decoded values.
 2. **Dictionary-preserved output.** One code per row, written into a
    caller-owned buffer, with the dictionary decoded once per column chunk into
    a caller-owned buffer. Runs and packed groups of codes are expanded; the
-   dictionary lookup is not performed.
+   dictionary lookup is not performed. Codes are written as `u8`, `u16`, or
+   `u32`, the narrowest that holds the dictionary, because at this level writing
+   the codes is the cost.
 3. **Materialized values.** One value per row, written into caller-owned
    buffers with a validity bitmap. Strings and binary values are copied into
    one contiguous caller-owned bytes buffer with an offsets array. An adapter
    can present that buffer in a view layout without copying the bytes again.
 
-Predicate evaluation on dictionary codes and on runs happens inside the reader
-at the encoded-block level, so callers at every level benefit from it.
+Predicate evaluation on dictionary codes and on runs happens in the column
+reader, on runs and packed groups, so callers at every level benefit from it.
 
-Later forms, added on evidence:
-
-- **Views into page bytes** for strings and binary values, with no copy. These
-  conflict with scratch reuse: decompressing the next page into the same
-  scratch buffer would overwrite the bytes earlier views point to. They require
-  either that the caller finish with a page's views before the next page is
-  decoded, or that each page's buffer be retained and reference-counted while
-  any view exists.
-- **Zero-copy value views** where the stored layout already matches what the
-  caller needs. This applies cleanly to fixed-length byte arrays and to
-  uncompressed, null-free pages whose values are suitably aligned in the buffer.
-  It has the same buffer-lifetime requirement as views and is a narrow
-  optimization.
+**Dictionary fallback.** A column chunk often starts with dictionary-encoded
+pages and continues with plain pages once the writer gives up on the
+dictionary. The column reader decides once per chunk, before decoding it:
+dictionary-preserved output is produced only for a chunk whose data pages are
+all dictionary-encoded, and any other chunk is materialized. It knows this from
+`encoding_stats` where the writer recorded it, and otherwise from the page
+headers. A caller sees one form per chunk. Details are in
+`docs/design-notes.md`.
 
 ### Block-synchronous multi-column scan
 
 The reader can decode several columns in lockstep, one block of rows at a time,
 and hand the aligned blocks to a caller-supplied function. This lets an engine
 evaluate multi-column expressions while the data is cache-resident, without
-Parkay owning an expression evaluator.
-
-Columns have very different page sizes in rows, so every column decoder is
-resumable at any row within a page, which block-at-a-time decoding already
-requires. A lockstep scan over several columns keeps one decompressed page per
-column alive at once. It is intended for small groups of columns, such as the
-inputs to a filter expression, where those pages stay cache-resident together;
-it is not the mechanism for decoding a wide projection.
+Parkay owning an expression evaluator. It is meant for small groups of columns,
+such as the inputs to a filter, not for decoding a wide projection.
 
 ### Nulls
 
@@ -452,97 +517,48 @@ Nested columns (lists, maps, structs) are a primary performance target.
   derived from repetition levels by building masks and counting.
 - At file open, the schema is turned into a per-leaf plan holding those
   thresholds for each ancestor.
-- Level decoding is vectorized, and long runs of identical levels are handled in
-  bulk.
-- Sibling leaves under the same list or struct carry the same levels for that
-  ancestor. The plan nominates one projected leaf per ancestor to produce its
-  offsets and validity, and the other leaves skip that reconstruction.
-- A row selection counts top-level records, not leaf values. Applying one to a
-  repeated column means finding record boundaries from the repetition levels,
-  and using each page's first row index from the offset index to skip whole
-  pages.
+- A row selection counts top-level records, not leaf values, and a record may
+  span two pages when there is no offset index.
 
 ### Strings
 
 - UTF-8 validity of a dictionary is established once; rows gathered from it need
   no further checking.
-- Plain-encoded string pages interleave a length prefix with each value, so the
-  page itself cannot be validated as one buffer. Non-dictionary strings are
-  validated in bulk over the contiguous output bytes after the values have been
-  copied there, with the additional check that each value starts on a character
-  boundary. Encodings that store value bytes contiguously can be validated the
-  same way.
-- When views into page bytes are added, a plain page can be validated in place
-  by overwriting each length prefix with ASCII spaces and validating the whole
-  page in one call. This needs a mutable page buffer, which a decompressed page
-  is.
+- A plain-encoded page is validated where it lies, before any value is copied.
+  A length prefix whose bytes are all below `0x80` is itself valid UTF-8, so a
+  span of values is validated prefixes and all, in one call, and the check that
+  each value starts on a character boundary comes free. A prefix with a larger
+  byte ends the span. The reasoning is in `docs/design-notes.md`.
 
 ### Compression and integrity
 
 - Codec contexts are created once per worker and reused across pages.
 - The fastest available implementation of each codec is used.
-- The codec interface accepts a batch of pages, so the common case is a batch of
-  one, and parallel or offloaded decompression remains possible later without an
-  API change.
 - Page checksums are verified using hardware-accelerated CRC when present, and
   verification is on by default.
+- Every option of a codec that affects safety or speed is passed where the codec
+  is called, never left to the codec's default. The limit on decompressed size,
+  for example, is the size the page declares, not the library's own default.
+- Page framing is one module, shaped so decryption can be added later without
+  changing the code around it.
 
 ## 6. Writer
 
-### Encoding path
-
-- Null values are removed while encoding, without first building a list of
-  non-null positions and gathering through it.
-- For flat nullable columns, definition levels are produced directly from the
-  input validity bitmap as runs.
-- Minimum, maximum, and null count are computed while each block is already in
-  cache for encoding.
-- Bit-packing, run-length encoding, delta encoding, and byte-stream-split use
-  the same kernel strategy as the reader.
-
-### Encoding and compression selection
-
+- The encoding path uses the same kernel strategy as the reader, and computes
+  statistics while each block is in cache for encoding.
 - The encoding for a column chunk is chosen by sampling values across the
-  buffered row group, not from its first values only.
-- Sampling across a row group means holding its values unencoded until the
-  choice is made, which for wide tables can be a large amount of memory.
-  Buffering is therefore governed by a byte budget, not only a row count. When
-  the budget is reached before the row group is complete, encodings are chosen
-  from what has been buffered so far and encoding begins.
-- Dictionary encoding is abandoned early when the sampled cardinality makes it
-  unprofitable. Other columns use a hash table that stores dictionary indices,
-  created with a moderate initial capacity: growing the table was the largest
-  single cost measured, and sizing it to the full value count hurt
-  low-cardinality columns. A direct-address table for small integer domains is
-  a measured but modest gain and is added only if profiles call for it.
-- Compression may be skipped for data that will not benefit from it.
-- All of these choices are constrained by a **compatibility profile**. Being
-  valid under the specification does not guarantee that older readers can read
-  a file, so newer encodings and page formats are enabled only under profiles
-  that allow them.
-
-### Parallelism
-
-Column chunks are encoded and compressed independently, so they can run as
-separate units of work. Completed chunks are written out in file order. As in
-the reader, the core produces the units of work and the layer above schedules
-them.
-
-### Layout for fast reads
-
-- The page index and footer are written contiguously at the end of the file so
-  that one speculative read of the tail opens the file. Bloom filters are placed
-  so they can be fetched on demand, not pulled in by that tail read.
-- Page indexes and page checksums are written by default.
-- Pages use a moderate fixed target size with a row-count limit. The target is
-  not tuned to the writing machine.
-- Where the input is sorted, the writer records the sort order, and it writes
-  statistics in a form that keeps pruning effective (for example truncated
-  bounds for long values).
-- Footer size affects how many requests it takes to open a file. Options that
-  keep it small, such as omitting statistics for columns no reader filters on,
-  are worth offering. Row group size trades a smaller footer against coarser
-  pruning and less parallelism, so it is left to the caller.
+  buffered row group, under a byte budget rather than only a row count.
+- All encoding and compression choices are constrained by a **compatibility
+  profile**. Being valid under the specification does not guarantee that older
+  readers can read a file, so newer encodings and page formats are enabled only
+  under profiles that allow them.
+- Column chunks are encoded and compressed independently, so they can run as
+  separate units of work. Completed chunks are written out in file order. As in
+  the reader, the core produces the units of work and the layer above schedules
+  them.
+- Files are laid out for fast reads: the page index and footer are written
+  contiguously at the end of the file, so that one speculative read of the tail
+  opens it, and page indexes and page checksums are written by default.
 
 ## 7. Reference scanner
 
@@ -550,26 +566,13 @@ The scanner is the layer that turns the core into something that reads files end
 to end. It exists to prove the core's API, to serve as the benchmark vehicle,
 and to be the basis for engine integrations.
 
-Its initial scope is deliberately small:
-
-- A thread pool that executes the core's units of work.
-- Positioned reads on local files.
-- Scan planning: projection, the closed predicate set, pruning, coalescing of
-  nearby byte ranges into fewer reads, and splitting very large ranges into
-  parallel reads. The thresholds differ between local and remote storage and are
-  scanner policy, not core behavior.
-- Parallelism at the granularity of row group and column. Where a column chunk
-  has an offset index, it can also be split into page ranges; many real files
-  have none, and the planner then stays at row group and column granularity.
-  Workers that share a dictionary-encoded chunk share one decoded dictionary,
-  which is decoded before the page ranges are dispatched.
+Its initial scope is deliberately small: a thread pool that executes the core's
+units of work, positioned reads on local files, and scan planning (projection,
+the closed predicate set, pruning, coalescing and splitting of byte ranges, and
+the order in which predicates run).
 
 Object storage, asynchronous I/O interfaces, and direct I/O are later additions
-to the scanner, not to the core. Concerns that sit above a single file, such as
-pruning files from table-format manifests before opening them, opening many files
-concurrently, and overlapping one file's data reads with the next file's metadata,
-belong to the scanner or the engine. The core's part is to hold no global state, so
-many files can be in flight at once.
+to the scanner, not to the core.
 
 ## 8. Integrations
 
@@ -582,25 +585,12 @@ The core itself does not depend on Arrow.
 ### DataFusion
 
 DataFusion, or a similar Arrow-based engine, is the intended first real
-consumer. The integration is a separate optional layer that:
-
-- Presents Parkay as a file source the engine can scan.
-- Translates the subset of the engine's filter expressions that fit the closed
-  predicate set into Parkay predicates, and leaves the remainder for the engine
-  to evaluate.
-- Maps the engine's partitioning and scheduling onto the core's units of work,
-  so the engine's runtime, not the reference scanner's thread pool, drives
-  execution.
-
-A plain stream of fully decoded record batches would deliver only the kernel
-improvements. The integration therefore needs to use pruning, selection-aware
-decoding, and dictionary-preserved output to show the design's benefit, and how
-far the engine's interfaces allow that is something to establish early.
-
-The engine's current interfaces do not constrain the core's lower-level APIs.
-Encoded blocks and the block-synchronous scan are not expected to fit a
-general-purpose engine without custom operators, and they are designed for what
-the core can offer, not for what the first engine can consume.
+consumer, as a separate optional layer. A plain stream of fully decoded record
+batches would deliver only the kernel improvements. The integration therefore
+needs to use pruning, selection-aware decoding, and dictionary-preserved output
+to show the design's benefit, and how far the engine's interfaces allow that is
+something to establish early. The engine's interfaces do not constrain the
+core's lower-level APIs.
 
 ## 9. Format scope
 
@@ -616,14 +606,16 @@ the core can offer, not for what the first engine can consume.
 - Within the pinned specification, features are staged. Flat and nested columns
   of the standard physical and logical types come first. Encryption and the
   remaining format surface come later. Variant and geospatial types are excluded
-  from the first version.
+  from the first version. The pinned version includes the ALP encoding for
+  floating-point columns, so the reader must decode it.
 
 ## 10. Safety and correctness
 
 ### Unsafe code
 
-The repository denies `unsafe_code` crate-wide. `fearless_simd` exposes SIMD,
-including raw intrinsics, through a safe API, so kernels are expected to need
+The repository denies `unsafe_code` crate-wide. `fearless_simd` is intended to
+expose SIMD, including raw intrinsics, through a safe API (capabilities to be
+verified in step 2; see section 14), so kernels are expected to need
 little or no `unsafe` of their own. What may remain is uninitialized scratch
 buffers and any unchecked indexing that measurement shows is necessary. The
 intended approach is to keep the crate-wide default and confine any such
@@ -647,36 +639,98 @@ that way.
   owns may carry padding.
 - Corrupt input produces an error, never undefined behavior or a panic.
 
+### Limits
+
+Everything has a limit. A size or a count read from a file is compared with its
+limit before it is used to allocate, to ask for bytes, or to bound a loop.
+
+- The limits are one plain value, given when a file is opened. Nothing after
+  opening checks a limit yet. When page framing adds limits that later steps
+  check, the value is kept with the metadata, so everything derived from a file
+  uses the same ones.
+- Each limit has a named default, defined with the code that checks it. A caller
+  reading untrusted files sets lower ones.
+- Exceeding a limit is an ordinary error that names the limit and the value
+  found. It is not a panic.
+- Where a bound follows from the size of the input, the code asserts that
+  derivation and adds no separate limit. The footer directory is the example:
+  its size is bounded by the footer's.
+- What Parkay allocates for one file's metadata (the retained footer, the
+  directory, the schema) is in each case bounded by a constant multiple of the
+  footer's size, so the limit on the footer bounds them all. The working memory
+  of the pass that opens a file is bounded the same way.
+- Loops are bounded in the same way. A loop over input either consumes input on
+  every iteration or counts against a value that was checked beforehand.
+  Recursion is used only with a depth limit enforced in code.
+
+The first limits are the size of the footer and the nesting depth of the schema.
+The footer's default is 1 GiB, a few times the largest external reference footer
+(~240 MB for a 100,000-column table; not part of the generated benchmark corpus),
+and the schema's is 128 levels. Limits on the page header, the decompressed page,
+and the dictionary are added with page framing.
+
+### Assertions
+
+Parkay separates two kinds of failure.
+
+- An **operating error** is anything a file, an I/O result, or a limit can
+  cause. It is expected, and it is returned as an error. This is the rule that
+  corrupt input never panics.
+- A **programmer error** is a broken invariant in Parkay's own code. It is not
+  expected, and continuing would risk returning or writing wrong data, so it
+  stops the program through an assertion.
+
+No assertion may be reachable from input alone. An input that trips one has
+found a bug, either a missing check or a wrong assertion. Fuzzing looks for
+exactly that: fuzz targets are built with assertions and overflow checks on.
+
+- Functions assert the arguments, results, and invariants they rely on. By
+  default an assertion is compiled only into debug builds, tests, and fuzz
+  targets, so it costs nothing in a release build. Adding such assertions
+  throughout the Thrift reader left the machine code of its benchmark unchanged
+  (`docs/perf/thrift-skip.md`).
+- An assertion stays on in a release build only where it is certain to be
+  cheap: a check that runs once per page or less often, or a check on entry to a
+  kernel that a measurement shows is free. There a failed check is one compare
+  and a branch that is never taken. Inside a loop over values the same check can
+  stop the compiler from vectorizing the loop, so it is never left on there.
+- The checks worth keeping on in release are the ones that stand between a bug
+  and wrong data leaving Parkay: what the writer is about to put in a file, and
+  what pruning is about to drop.
+- A property is checked on two different paths where possible. The writer
+  asserts what it is about to write, and the reader checks the same property
+  when it reads, as an operating error. A position is checked when it is
+  recorded and asserted when it is used.
+- Relationships between constants, and the sizes of types that must stay small,
+  are asserted at compile time.
+- Tests cover what must not happen as well as what must: invalid input, valid
+  input as it becomes invalid, and a test for every rejection.
+
 ### Testing
 
 - Every SIMD kernel is tested against its scalar reference across all bit
   widths, lengths, and alignments.
 - Fused kernels are tested against the composed stages they replace.
 - The reader and writer are tested differentially against arrow-rs: files
-  written by one are read by the other and compared.
-- A small corpus of real files from many writers (for example fastparquet,
-  pyarrow, parquet-java, DuckDB, Spark, and Go implementations) guards the
-  reader's tolerance of non-conforming but common output, such as fastparquet's
-  empty lists with element type 0.
+  written by one are read by the other and compared, and real files from many
+  writers guard the reader's tolerance of non-conforming output.
+- Pruning has its own oracle, because reading the same file as arrow-rs does not
+  exercise it: a scan with pruning must return exactly the rows of a scan
+  without pruning followed by the same filter. This runs as a property test over
+  generated data and predicates, and over the corpus of real files.
 - Parsers and round trips have property tests: generated values are encoded and
   decoded back, and arbitrary bytes must never cause a panic.
 - Fuzzing is part of the project from the start, covering the footer parser,
-  page decoding, and each kernel. Fuzz targets run under a nightly toolchain;
-  the crate itself stays on the pinned toolchain. Targets check more than the
-  absence of panics where an oracle exists: two paths through Parkay that must
-  agree (skipping a value and decoding it), and arrow-rs where both accept the
-  input. They are seeded from real footers and run with a short per-input
-  timeout, so input that makes the work grow out of proportion is caught. A fuzz
+  page decoding, and each kernel. Targets check more than the absence of panics
+  where an oracle exists: two paths through Parkay that must agree (skipping a
+  value and decoding it), and arrow-rs where both accept the input. A fuzz
   oracle is only trusted after it has been shown to catch a deliberately planted
   bug.
-- Interpreter-based checking covers the scalar paths and framing code. It does
-  not cover most SIMD intrinsics, which is why the scalar-reference tests carry
-  that weight.
 
 ## 11. Benchmarking
 
 The harness grows with the code. It is run through the task runner
-(`cargo xtask bench`, `report`, `profile`, `asm`) and aims to provide:
+(`cargo xtask bench`, `snapshot`, `report`, `profile`, `asm`) and aims to provide:
 
 - arrow-rs as the baseline on identical files and queries.
 - The relevant hardware limit for each workload (memory copy rate, raw codec
@@ -692,22 +746,15 @@ The harness grows with the code. It is run through the task runner
 - Tracking over time, so regressions (including autovectorization regressions
   from toolchain changes) are caught.
 
-Practice so far:
+Design comes before measurement. Before a component is built, its expected cost
+is sketched in `docs/perf/` against the four resources (network, storage,
+memory, CPU) and the latency and bandwidth of each, together with the hardware
+limit it should approach. The slowest resource a workload touches is considered
+first. The sketch is a hypothesis, and the benchmark that follows confirms it or
+replaces it.
 
-- Benchmarks run one at a time, never alongside builds or other benchmarks.
-- Fixtures include real files (parquet-testing), synthetic footers of chosen
-  shapes, and external sets such as
-  [alamb/parquet_footer_parsing](https://github.com/alamb/parquet_footer_parsing),
-  which allows comparison with published arrow-rs results. A change is judged on
-  more than one shape of input: synthetic fixtures alone have been shown to
-  over-represent one shape.
-- Profiling uses sampling (`samply`, macOS `sample`), the generated assembly, and
-  hardware counters (Xcode's `xctrace` CPU Counters template on macOS), so a
-  change is explained, not only timed.
-- Every forced inline or cold annotation is backed by a measurement, and what was
-  tried, kept, and rejected is logged in `docs/perf/`.
-- Not yet covered: x86-64 measurements, tracking results over time, and request
-  counting for object storage.
+How the benchmarks are run so far, and the limits of the results, are in
+`docs/design-notes.md`.
 
 ## 12. Decisions against and deferrals
 
@@ -727,6 +774,9 @@ Practice so far:
 | Generated Thrift decoders (the `thrift` crate or a code generator) | They decode eagerly into owned structures; the lazy design needs a reader that can skip |
 | Inline assembly | Not used anywhere; SIMD goes through `fearless_simd` |
 | Bulk-skipping Thrift lists of fixed-width types | No Parquet structure contains such a list |
+| Decoders that push values into a generic consumer | It relies on the compiler specializing every decoder for every consumer; one function per column that holds the branching and calls kernels keeps each loop compiled once and testable alone |
+| A driver loop inside the core that the caller polls | Sequencing belongs to the layer above; the core is steps over plain data, and a convenience driver can sit on top of them |
+| An accessor that returns one decoded column chunk, beside extraction | One way to read column-chunk facts; a caller that wants one chunk asks for one column and one row group |
 
 ### Deferred
 
@@ -743,8 +793,13 @@ Practice so far:
 | Adaptive sizing of the speculative tail read | A caller-supplied hint suffices |
 | Views into page bytes and zero-copy value views | Need retained page buffers, a second buffering model |
 | A range-based selection representation | Added only if the bitmask proves costly for sparse selections |
-| A Thrift encoder | Built with the writer, along with encode/decode round-trip fuzzing |
-| A vectorized pass marking varint boundaries for Thrift skipping | The one untried structural idea for skip speed; set aside for now |
+| Merging dictionaries across a dictionary fallback | Lets a caller keep codes for a chunk whose later pages are plain; added when a caller asks |
+| A Thrift encoder | Built with the writer, along with encode/decode round-trip fuzzing. Until then tests build footers with the generic test encoder |
+| The complete set of metadata structures | Generated from one table, decoder and encoder together, when the writer starts |
+| Decoding column-chunk facts during the pass that opens a file | Added only if the benchmark of reading every column's facts shows the second pass matters; the decoder is shaped to be reached from either place |
+| A vectorized pass marking varint boundaries for Thrift skipping | An untried structural idea for skip speed. It would help where comparing column chunks with earlier ones cannot: footers of one row group, and the first row group of any footer |
+| Vector instructions for the comparison of a column chunk with its template | The compiler leaves it scalar. A `fearless_simd` kernel is the candidate, when that dependency is first used |
+| Reading a column chunk's facts at the offsets its template has them | A chunk that matches its template bit for bit has every field where the template has it. It needs the open pass to retain, for each chunk, which chunk it matched |
 | Fuzzing in CI | Fuzz targets are run by hand for now |
 
 ## 13. Order of work
@@ -770,28 +825,65 @@ The overall order:
 Step 2 is being built from the bottom up, in small pieces that each end with tests
 passing:
 
-- Done: the specification pinned and vendored; the Thrift compact-protocol reader,
-  with property tests, fuzzing, and its skip path profiled and optimized; the
-  first part of the benchmark harness (step 1), covering the Thrift layer.
-- Next: opening a file without I/O (accepting any tail of the file and reporting
-  what is missing) and the lazy footer index, with the first metadata decoders
-  and their comparison against arrow-rs.
+- Done (M0/M1): the specification pinned and vendored (M0); the Thrift
+  compact-protocol reader, with property tests, fuzzing, and its skip path
+  profiled and optimized; the first part of the benchmark harness (step 1),
+  covering the Thrift layer (M1).
+- Done (M2): opening a file without I/O, the footer directory, the schema as a
+  separate value shared between files, and extraction of column-chunk facts into
+  caller-owned storage, with differential tests and fuzzing against arrow-rs and
+  benchmarks against the acceptance targets. The rule behind it, aimed at scans
+  over many files: Parkay owns only what it keeps past the call that receives
+  it, such as the footer, which it copies. Bytes it reads only while decoding
+  are borrowed from the caller. What was measured is in `docs/perf/open.md`. The
+  steps after opening (ranges for the page index, Bloom filters, and data) come
+  with pruning and page framing.
 - Then: page framing for one column chunk (headers, checksums, decompression with
   length checks), and a first scalar read of flat nullable integer columns.
 
+When a step starts, its notes in `docs/design-notes.md` and its entries in
+`docs/github-performance-ideas.md` are read again and settled.
+
 ## 14. Open questions
 
-- **Unsafe policy.** Confirm the scoped approach to `unsafe` described in
-  section 10.
+- **Unsafe policy.** Confirm the scoped approach to `unsafe` in section 10.
 - **Engine interface fit.** How much of pruning, selection, and encoded output
   the first engine's extension points can actually consume.
 - **Fusion extent.** Settled by the experiment in step 3.
 - **Compatibility profiles.** Which profiles exist and which is the default.
-- **Ownership of retained metadata.** Whether the footer bytes behind lazily
-  decoded metadata are uniquely owned or shared (for metadata caches and concurrent
-  scans), and with which type.
-- **Mismatched field types in metadata.** What a decoder does with a field that
-  has the expected id but an unexpected wire type: an error, or skipping the
-  field.
-- **Macros for metadata decoders.** Whether the long tail of simple structures is
-  generated, decided once the first decoders exist.
+- **How reading every column's facts gets faster.** Extraction parses each
+  chunk it is asked for, at about the speed the open pass had before it compared
+  chunks, and is now most of the cost of reading everything. Two candidates: decoding during the pass that
+  opens the file when a caller wants everything, and reading a chunk's facts at
+  the offsets its template has them (section 12). The second changes what the
+  metadata retains. Neither is built.
+- **The one recursive function (settled for M1/M2).** Thrift `skip` recurses to
+  a fixed depth (`SKIP_DEPTH_MAX`) because the iterative form measured slower.
+  `AGENTS.md` codifies the adapted rule (no recursion without a code-enforced
+  depth limit listed in `ARCHITECTURE.md`), and `ARCHITECTURE.md` records the
+  bounds for `CompactReader::skip`.
+- **Two catch-all matches in the Thrift reader.** Writing them exhaustively, as
+  the style asks, changes the machine code of the skip path. They stay as they
+  are until that change is measured.
+- **Encoded blocks with nulls and nesting.** A run counts stored values while
+  validity counts rows, so a block's extent needs defining in both, and nested
+  levels have no form at this level yet.
+- **Whether encoded blocks are public in the first version.** Section 1 says
+  alternatives are added when a benchmark or an integration needs them, and
+  `docs/design-notes.md` ("DataFusion") notes that the first engine is not
+  expected to consume encoded blocks without custom operators. They can remain
+  the internal base layer and be exposed publicly when a consumer exists.
+- **When the engine is first tried.** Section 8 says engine fit should be
+  established early, and section 13 puts the Arrow adapter and DataFusion at
+  step 6. A thin slice over flat integers during step 2 would test the shape of
+  the API (caller-owned buffers, bitmask selections, string layout) before more
+  is built on it.
+- **Whether the writer belongs in step 2.** It doubles the surface before the
+  reader's interfaces are proven, and arrow-rs already writes the fixtures.
+- **`zrip` and `fearless_simd`.** Both were chosen on comparisons that are not in
+  the repository and were run on one machine. How much of the kernel surface stays
+  free of `unsafe` depends on what `fearless_simd` exposes safely for bit-unpacking,
+  compress/expand, and (if measured faster than scalar loads) gathers, which has
+  not been verified yet. The first SIMD task of step 2 (a bit-unpacking kernel on
+  NEON and AVX2) tests `fearless_simd`, and the codec comparison is brought into
+  the benchmark harness before `zrip` is depended on.

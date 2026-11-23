@@ -9,10 +9,10 @@ use libfuzzer_sys::fuzz_target;
 use parkay::thrift::CompactReader;
 
 fuzz_target!(|data: &[u8]| {
-    let Some((ty, input)) = common::split(data) else {
+    let Some((element_type, input)) = common::split(data) else {
         return;
     };
-    let mut reader = CompactReader::new(input);
-    let _ = reader.skip(ty);
+    let mut reader = CompactReader::new(input, 0);
+    let _ = reader.skip(element_type);
     assert!(reader.position() <= input.len());
 });

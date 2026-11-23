@@ -1,11 +1,13 @@
 # parkay
 
 A ground-up Rust implementation of a Parquet reader and writer, aimed at maximum
-performance. Early development: there is no functionality yet.
+performance. Early development: it opens a file and reads its metadata (the schema, and
+what the footer records for each column chunk). It does not read pages yet.
 
 - Design: [`docs/design.md`](docs/design.md)
 - Module boundaries and invariants: [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - Contributor and agent workflow: [`AGENTS.md`](AGENTS.md)
+- What has been measured: [`docs/perf/`](docs/perf/)
 
 ## Setup
 
