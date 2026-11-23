@@ -92,12 +92,12 @@ pub enum ThriftError {
         /// The byte found.
         byte: u8,
     },
-    /// Containers being skipped nested deeper than [`MAX_SKIP_DEPTH`](super::MAX_SKIP_DEPTH).
+    /// Containers being skipped nested deeper than [`SKIP_DEPTH_MAX`](super::SKIP_DEPTH_MAX).
     #[error("containers nest deeper than {limit} at byte {offset}")]
     DepthExceeded {
         /// Offset of the container that crossed the limit.
         offset: u32,
-        /// The limit, [`MAX_SKIP_DEPTH`](super::MAX_SKIP_DEPTH).
+        /// The limit, [`SKIP_DEPTH_MAX`](super::SKIP_DEPTH_MAX).
         limit: u16,
     },
 }
