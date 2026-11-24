@@ -6,7 +6,7 @@
 //! build inputs that real writers rarely produce but the protocol allows: fields out of
 //! order, long-form field ids, unknown fields, and repeated fields.
 
-use super::ElementType;
+use super::types::{ElementType, wire_type};
 
 /// One Thrift value. A struct lists its fields as `(id, value)` in the order to write
 /// them.
@@ -50,18 +50,18 @@ impl Value {
 /// The 4-bit type code the protocol uses for `element_type`.
 pub(crate) const fn type_code(element_type: ElementType) -> u8 {
     match element_type {
-        ElementType::Bool => 1,
-        ElementType::I8 => 3,
-        ElementType::I16 => 4,
-        ElementType::I32 => 5,
-        ElementType::I64 => 6,
-        ElementType::Double => 7,
-        ElementType::Binary => 8,
-        ElementType::List => 9,
-        ElementType::Set => 10,
-        ElementType::Map => 11,
-        ElementType::Struct => 12,
-        ElementType::Uuid => 13,
+        ElementType::Bool => wire_type::BOOL_TRUE,
+        ElementType::I8 => wire_type::I8,
+        ElementType::I16 => wire_type::I16,
+        ElementType::I32 => wire_type::I32,
+        ElementType::I64 => wire_type::I64,
+        ElementType::Double => wire_type::DOUBLE,
+        ElementType::Binary => wire_type::BINARY,
+        ElementType::List => wire_type::LIST,
+        ElementType::Set => wire_type::SET,
+        ElementType::Map => wire_type::MAP,
+        ElementType::Struct => wire_type::STRUCT,
+        ElementType::Uuid => wire_type::UUID,
     }
 }
 
@@ -101,7 +101,11 @@ pub(crate) fn put_list_header(element_type: ElementType, size: usize, out: &mut 
 )]
 pub(crate) fn encode(value: &Value, out: &mut Vec<u8>) {
     match value {
-        Value::Bool(b) => out.push(if *b { 1 } else { 2 }),
+        Value::Bool(b) => out.push(if *b {
+            wire_type::BOOL_TRUE
+        } else {
+            wire_type::BOOL_FALSE
+        }),
         Value::I8(v) => out.push(v.cast_unsigned()),
         Value::I16(v) => put_zigzag(i64::from(*v), out),
         Value::I32(v) => put_zigzag(i64::from(*v), out),
@@ -131,9 +135,19 @@ pub(crate) fn encode(value: &Value, out: &mut Vec<u8>) {
             let mut last = 0_i16;
             for (id, field) in fields {
                 let code = match field {
-                    Value::Bool(true) => 1,
-                    Value::Bool(false) => 2,
-                    other => type_code(other.element_type()),
+                    Value::Bool(true) => wire_type::BOOL_TRUE,
+                    Value::Bool(false) => wire_type::BOOL_FALSE,
+                    Value::I8(_)
+                    | Value::I16(_)
+                    | Value::I32(_)
+                    | Value::I64(_)
+                    | Value::Double(_)
+                    | Value::Binary(_)
+                    | Value::List(..)
+                    | Value::Set(..)
+                    | Value::Map(..)
+                    | Value::Struct(_)
+                    | Value::Uuid(_) => type_code(field.element_type()),
                 };
                 let delta = i32::from(*id) - i32::from(last);
                 if (1..=15).contains(&delta) {
@@ -147,7 +161,7 @@ pub(crate) fn encode(value: &Value, out: &mut Vec<u8>) {
                 }
                 last = *id;
             }
-            out.push(0);
+            out.push(wire_type::STOP);
         }
         Value::Uuid(bytes) => out.extend_from_slice(bytes),
     }

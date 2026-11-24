@@ -4,8 +4,9 @@ use std::path::Path;
 use proptest::prelude::*;
 
 use super::test_support::{Value, encoded, put_zigzag};
+use super::varint::UnsignedVarint;
 use super::{
-    CompactReader, ElementType, Field, FieldCursor, FieldType, Marks, SKIP_DEPTH_MAX, ThriftError,
+    CompactReader, ElementType, FieldCursor, FieldType, Marks, SKIP_DEPTH_MAX, ThriftError,
     VarintTarget,
 };
 
@@ -40,7 +41,17 @@ fn decode(reader: &mut CompactReader<'_>, element_type: ElementType) -> Result<V
             while let Some(field) = cursor.next(reader)? {
                 let value = match field.field_type() {
                     FieldType::Bool(b) => Value::Bool(b),
-                    _ => decode(reader, field_to_element(field))?,
+                    FieldType::I8 => decode(reader, ElementType::I8)?,
+                    FieldType::I16 => decode(reader, ElementType::I16)?,
+                    FieldType::I32 => decode(reader, ElementType::I32)?,
+                    FieldType::I64 => decode(reader, ElementType::I64)?,
+                    FieldType::Double => decode(reader, ElementType::Double)?,
+                    FieldType::Binary => decode(reader, ElementType::Binary)?,
+                    FieldType::List => decode(reader, ElementType::List)?,
+                    FieldType::Set => decode(reader, ElementType::Set)?,
+                    FieldType::Map => decode(reader, ElementType::Map)?,
+                    FieldType::Struct => decode(reader, ElementType::Struct)?,
+                    FieldType::Uuid => decode(reader, ElementType::Uuid)?,
                 };
                 fields.push((field.id(), value));
             }
@@ -80,19 +91,31 @@ fn decode_map(reader: &mut CompactReader<'_>) -> Result<Value, ThriftError> {
     Ok(Value::Map(key_type, value_type, entries))
 }
 
-fn field_to_element(field: Field) -> ElementType {
-    field
-        .field_type()
-        .element_type()
-        .expect("bool fields are handled by the caller")
-}
-
 // ---------------------------------------------------------------------------
 // Byte-level edge cases
 // ---------------------------------------------------------------------------
 
 fn reader_over(bytes: &[u8]) -> CompactReader<'_> {
     CompactReader::new(bytes, 0)
+}
+
+#[test]
+fn zigzag_decodes_the_ends_of_every_width() {
+    assert_eq!(0_u16.zigzag_decode(), 0);
+    assert_eq!(1_u16.zigzag_decode(), -1);
+    assert_eq!(2_u16.zigzag_decode(), 1);
+    assert_eq!((u16::MAX - 1).zigzag_decode(), i16::MAX);
+    assert_eq!(u16::MAX.zigzag_decode(), i16::MIN);
+    assert_eq!(0_u32.zigzag_decode(), 0);
+    assert_eq!(1_u32.zigzag_decode(), -1);
+    assert_eq!(2_u32.zigzag_decode(), 1);
+    assert_eq!((u32::MAX - 1).zigzag_decode(), i32::MAX);
+    assert_eq!(u32::MAX.zigzag_decode(), i32::MIN);
+    assert_eq!(0_u64.zigzag_decode(), 0);
+    assert_eq!(1_u64.zigzag_decode(), -1);
+    assert_eq!(2_u64.zigzag_decode(), 1);
+    assert_eq!((u64::MAX - 1).zigzag_decode(), i64::MAX);
+    assert_eq!(u64::MAX.zigzag_decode(), i64::MIN);
 }
 
 #[test]
@@ -467,6 +490,22 @@ fn value() -> impl Strategy<Value = Value> {
 }
 
 proptest! {
+    // The encoder here is written independently of the decoder: shift the value up one
+    // bit, and flip every bit if it was negative.
+    #[test]
+    fn zigzag_decode_inverts_encode(
+        value_i16 in any::<i16>(),
+        value_i32 in any::<i32>(),
+        value_i64 in any::<i64>(),
+    ) {
+        let encoded_i16 = ((value_i16 << 1) ^ (value_i16 >> 15)).cast_unsigned();
+        let encoded_i32 = ((value_i32 << 1) ^ (value_i32 >> 31)).cast_unsigned();
+        let encoded_i64 = ((value_i64 << 1) ^ (value_i64 >> 63)).cast_unsigned();
+        prop_assert_eq!(encoded_i16.zigzag_decode(), value_i16);
+        prop_assert_eq!(encoded_i32.zigzag_decode(), value_i32);
+        prop_assert_eq!(encoded_i64.zigzag_decode(), value_i64);
+    }
+
     #[test]
     fn encoded_values_decode_back_unchanged(value in value()) {
         let bytes = encoded(&value);
@@ -648,10 +687,10 @@ fn marks_say_which_bits_decide_where_a_value_ends() {
 
 #[test]
 fn marks_cover_long_binaries_and_padded_integers() {
-    // Marks are written a word at a time into a mask that grows in steps, so cross
-    // both a step and a word: a binary longer than a step, then an integer padded to
-    // more bytes than a word, which skipping accepts.
-    let mut bytes = encoded(&Value::Struct(vec![(1, Value::Binary(vec![0xAB; 700]))]));
+    // Marks are written a word at a time into a mask that grows in steps (4096 bytes),
+    // so cross both a growth step and a word: a binary longer than a step, then an
+    // integer padded to more bytes than a word, which skipping accepts.
+    let mut bytes = encoded(&Value::Struct(vec![(1, Value::Binary(vec![0xAB; 5000]))]));
     let stop = bytes.pop().unwrap();
     assert_eq!(stop, 0x00);
     bytes.push(0x16); // field 2, an i64
@@ -665,12 +704,123 @@ fn marks_cover_long_binaries_and_padded_integers() {
         .unwrap();
     assert_eq!(reader.position(), bytes.len());
     let mut expected = vec![0xFF, 0xFF, 0xFF]; // field 1 header and a two-byte length
-    expected.extend([0x00; 700]);
+    expected.extend([0x00; 5000]);
     expected.push(0xFF); // field 2 header
     expected.extend([0x80; 12]);
     expected.push(0xFF); // the stop marker
     assert_eq!(marks.mask(), expected);
     assert_eq!(marks.binaries(), [1]);
+}
+
+#[test]
+fn marks_grow_across_list_and_binaries_window_boundaries() {
+    // Exercise `skip_list_tail_growing` across both `Grow::Mask` (> 4096 bytes) and
+    // `Grow::Bins` (> 4096 binaries) for both binary lists and varint lists.
+    let bin_items: Vec<Value> = (0..4200)
+        .map(|i| Value::Binary(vec![u8::try_from(i % 251).unwrap(); (i % 5) + 1]))
+        .collect();
+    let int_items: Vec<Value> = (0..2500).map(|i| Value::I64(i * 1000)).collect();
+    let value = Value::Struct(vec![
+        (1, Value::List(ElementType::Binary, bin_items)),
+        (2, Value::List(ElementType::I64, int_items)),
+    ]);
+    let bytes = encoded(&value);
+    assert!(bytes.len() > 8192);
+
+    let mut plain = CompactReader::new(&bytes, 0);
+    plain.skip(ElementType::Struct).unwrap();
+    assert_eq!(plain.position(), bytes.len());
+
+    let marks = marks_of(&value);
+    assert_eq!(marks.binaries().len(), 4200);
+    // Verify every recorded binary offset points to a valid binary length in `bytes`.
+    for &offset in marks.binaries() {
+        let mut reader = CompactReader::new(&bytes, offset as usize);
+        let slice = reader.read_binary().unwrap();
+        assert!((1..=5).contains(&slice.len()));
+    }
+    // Flipping all unmarked bits must still skip to the exact end.
+    let flipped: Vec<u8> = bytes
+        .iter()
+        .zip(marks.mask())
+        .map(|(&byte, &mask)| byte ^ !mask)
+        .collect();
+    let mut rechecked = CompactReader::new(&flipped, 0);
+    rechecked.skip(ElementType::Struct).unwrap();
+    assert_eq!(rechecked.position(), bytes.len());
+}
+
+#[test]
+fn skip_and_marking_handle_struct_nesting_deeper_than_inline_stack() {
+    // Nest 10 levels of structs and lists of structs (well past `INLINE_STACK = 4`),
+    // mixing leaf fields, binaries, and nested containers at every level.
+    let mut current = Value::Struct(vec![
+        (1, Value::I64(123_456)),
+        (2, Value::Binary(b"leaf".to_vec())),
+    ]);
+    for level in 0..10 {
+        current = if level % 2 == 0 {
+            Value::Struct(vec![
+                (1, Value::I32(level)),
+                (
+                    2,
+                    Value::List(ElementType::Struct, vec![current.clone(), current]),
+                ),
+                (3, Value::Binary(vec![0x55; 3])),
+            ])
+        } else {
+            Value::Struct(vec![
+                (1, Value::Bool(true)),
+                (2, current),
+                (3, Value::I64(i64::from(level) * 1000)),
+            ])
+        };
+    }
+    let bytes = encoded(&current);
+    let mut plain = CompactReader::new(&bytes, 0);
+    plain.skip(ElementType::Struct).unwrap();
+    assert_eq!(plain.position(), bytes.len());
+
+    let marks = marks_of(&current);
+    let flipped: Vec<u8> = bytes
+        .iter()
+        .zip(marks.mask())
+        .map(|(&byte, &mask)| byte ^ !mask)
+        .collect();
+    let mut rechecked = CompactReader::new(&flipped, 0);
+    rechecked.skip(ElementType::Struct).unwrap();
+    assert_eq!(rechecked.position(), bytes.len());
+}
+
+/// Regression test for exponential backtracking between `skip_nested` and
+/// `skip_diagnose` when a deeply nested `Struct -> Map -> Struct` chain fails near the
+/// bottom. Both `skip` and `skip_marking` must fail in linear time.
+#[test]
+fn skip_deeply_nested_map_struct_failure_is_linear() {
+    let mut bytes = Vec::new();
+    // 30 levels of `Struct -> Map<Bool, Struct>` = depth 60 (below SKIP_DEPTH_MAX = 64),
+    // truncated at the bottom so every level unwinds an error.
+    for _ in 0..30 {
+        // Short-delta field +1 of type Map (11 = 0x0B).
+        bytes.push(0x1B);
+        // Map size = 1, key = Bool (2), value = Struct (12 = 0x0C), key payload = true.
+        bytes.extend_from_slice(&[0x01, 0x2C, 0x01]);
+    }
+    // Truncated I32 field at depth 60 so every enclosing map passes `check_fits`.
+    bytes.push(0x15);
+    let mut plain = CompactReader::new(&bytes, 0);
+    assert!(matches!(
+        plain.skip(ElementType::Struct),
+        Err(ThriftError::UnexpectedEof { .. })
+    ));
+
+    let mut marks = Marks::new();
+    let mut marking = CompactReader::new(&bytes, 0);
+    assert!(matches!(
+        marking.skip_marking(ElementType::Struct, &mut marks),
+        Err(ThriftError::UnexpectedEof { .. })
+    ));
+    assert_eq!(marks.mask(), []);
 }
 
 // ---------------------------------------------------------------------------
