@@ -7,13 +7,14 @@ description: How to measure performance in parkay — running benchmarks, A/B co
 
 Use `cargo xtask` for every measurement (`cargo xtask <cmd> --help` for flags).
 
-## Execution rules
+The execution rules (sequential runs, background runs, no subagents, machine refusals) are in `AGENTS.md`. This skill covers the procedure.
 
-- Run `bench` in the background and wait via the harness (`t3_background_wait`); never poll or sleep.
-- Run benchmarks yourself — do not delegate them to a subagent.
-- One measurement at a time: `xtask` locks out concurrent `bench`/`profile`/`check`/`fuzz`/`asm`, and do not run plain `cargo` builds or tests while measuring.
-- If `bench` refuses the machine (battery, low power, throttling, busy process), report the condition and stop. Pass `--allow-noisy` only if the user asks. Never use results from a run that slept.
-- Before benchmarking third-party candidate crates (codecs, hashes, UTF-8, CRC), list candidates and ask the user first.
+## Before you start
+
+- Before benchmarking third-party candidate crates (codecs, hashes, UTF-8, CRC), list the candidates and ask the user first.
+- Do not run plain `cargo` builds or tests while measuring. `xtask` locks out concurrent `bench`/`profile`/`check`/`fuzz`/`asm`, but a build still adds noise.
+- Wait for `bench` through the harness (`t3_background_wait`); never poll or sleep.
+- Never use results from a run that slept.
 
 ## A/B workflow
 
@@ -22,7 +23,7 @@ Never toggle variants by editing source mid-run or copying files to `/tmp`.
 1. Record the starting tree: `cargo xtask snapshot base` (or use a commit).
 2. Make the change.
 3. Run `cargo xtask bench --entry ... --workload ... --against base --save NAME` (alternates `ab`/`ba`, default 6 rounds; builds `a` in its own target dir and refuses if `bench-support/`, `benches/`, or `testdata/` differ between sides). Use `--quick` only to explore; decide with full runs across the whole corpus.
-4. Use `--bench thrift` only when a profile points into `parkay::thrift`. Refresh `arrow-rs` (`--reference`) only when `report` marks it `STALE`.
+4. Use `--bench thrift` only when a profile points into `parkay::thrift`. Save `arrow-rs` once as the reference (`--reference`); refresh it only when `report` marks it `STALE`.
 
 ## Reading results, profiles, and codegen
 

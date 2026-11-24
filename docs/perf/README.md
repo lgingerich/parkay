@@ -1,6 +1,6 @@
 # Performance sketches and measurement logs
 
-This directory holds pre-implementation performance sketches and measurement logs.
+This directory holds pre-implementation performance sketches, crate evaluations, and measurement logs.
 
 ## Current harness (8-entry corpus)
 
@@ -19,6 +19,10 @@ cargo xtask bench --bench thrift --save thrift-base   # parkay thrift skip suite
 cargo run --release --example metadata_memory         # retained heap footprint
 cargo run --release --example footer_stats            # corpus footer shape & field counts
 ```
+
+## Crate evaluations
+
+- [`dependencies.md`](dependencies.md) — Benchmark-backed hot-path crate choices (`zrip`, `snap`, `lz4_flex`, `simdutf8`, `foldhash`/`hashbrown`, `crc32fast`, plus `fearless_simd` if explicit SIMD is ever needed) so later phases don't repeat crate selection.
 
 ## Historical logs (pre-corpus-refactor)
 

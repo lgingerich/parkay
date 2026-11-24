@@ -3,7 +3,7 @@
 > **Status: Historical** — Pre-M2 footer-copy measurement (2026-11-21) using pre-refactor fixture names and removed temporary `benches/thrift.rs` workloads.
 > Pre-templates, `memcpy` was 2%–4% of `skip`; after M2 chunk templates accelerated multi-row-group opens, `memcpy` is ~13%–14% of `open` (`docs/perf/open.md`).
 
-The measurement behind the decision to copy the footer at open (`docs/design-notes.md`,
+The measurement behind the decision to copy the footer at open (`docs/subsystems/metadata.md`,
 "Retained metadata: ownership and shape"). It was taken once, on 2026-11-21, on one Apple M3 Max, with
 two temporary workloads in `benches/thrift.rs` that were then removed. M2's open path
 now exists (`docs/perf/open.md`); benchmark that path directly instead of restoring them.
@@ -36,7 +36,7 @@ open of a large file.
 
 Conclusion: copying into fresh memory costs more than the copy when the pages
 fault. This first suggested an entry point that takes an owned buffer and keeps
-it. That was set aside in review (the reasons are in `docs/design-notes.md`,
+it. That was set aside in review (the reasons are in `docs/subsystems/metadata.md`,
 "Retained metadata: ownership and shape"), because of what this measurement does not show:
 
 - It compares against `skip` alone, the smallest possible open. At the time of this
