@@ -7,14 +7,13 @@ description: How to measure performance in parkay — running benchmarks, A/B co
 
 Use `cargo xtask` for every measurement (`cargo xtask <cmd> --help` for flags).
 
-The execution rules (sequential runs, background runs, no subagents, machine refusals) are in `AGENTS.md`. This skill covers the procedure.
+## Execution rules
 
-## Before you start
-
+- Run benchmarks yourself — do not delegate them to a subagent.
+- Run `bench` in the background and wait via the harness (`t3_background_wait`); never poll or sleep.
+- One measurement at a time: `xtask` locks out concurrent `bench`/`profile`/`check`/`fuzz`/`asm`, and do not run plain `cargo` builds or tests while measuring.
+- If `bench` refuses the machine (battery, low power, throttling, busy process), report the condition and stop. Pass `--allow-noisy` only if the user asks. Never use results from a run that slept.
 - Before benchmarking third-party candidate crates (codecs, hashes, UTF-8, CRC), list the candidates and ask the user first.
-- Do not run plain `cargo` builds or tests while measuring. `xtask` locks out concurrent `bench`/`profile`/`check`/`fuzz`/`asm`, but a build still adds noise.
-- Wait for `bench` through the harness (`t3_background_wait`); never poll or sleep.
-- Never use results from a run that slept.
 
 ## A/B workflow
 
