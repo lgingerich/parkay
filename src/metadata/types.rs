@@ -336,25 +336,6 @@ pub enum ColumnOrder {
     Unrecognized,
 }
 
-/// The fields of `ColumnMetaData` an extraction decodes, as bits numbered by field id.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Wanted {
-    pub(super) fields: u32,
-    pub(super) location: bool,
-    pub(super) statistics: bool,
-}
-
-impl Wanted {
-    /// Encodings, codec, value count, both sizes, and the data page offset.
-    const LOCATION_REQUIRED: u32 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
-    /// The above and the dictionary page offset, which a chunk may not have.
-    pub(super) const LOCATION: u32 = Self::LOCATION_REQUIRED | (1 << 11);
-    /// The statistics, which a chunk may not have.
-    pub(super) const STATISTICS: u32 = 1 << 12;
-    /// The highest field id any group needs.
-    pub(super) const FIELD_ID_MAX: i16 = 12;
-}
-
 /// Where a column chunk's bytes are in the file, and how they are encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {

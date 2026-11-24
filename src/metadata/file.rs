@@ -3,7 +3,7 @@
 
 use super::errors::{FooterError, Structure};
 use super::types::{ColumnOrder, KeyValue};
-use super::utils::read_str;
+use super::utils::{footer_u32, invalid_value, read_str};
 use super::wire::file_metadata::{Footer, RowGroup, column_order_decode};
 use super::wire::key_value::key_value_decode;
 use crate::thrift::{CompactReader, ElementType};
@@ -70,8 +70,7 @@ impl Metadata {
     /// The number of row groups.
     #[must_use]
     pub fn row_group_count(&self) -> u32 {
-        // Every row group took at least a byte of a footer whose length is a `u32`.
-        u32::try_from(self.row_groups.len()).unwrap_or(u32::MAX)
+        footer_u32(self.row_groups.len())
     }
 
     /// The number of leaf columns. Every row group has one column chunk for each.
@@ -123,11 +122,7 @@ impl Metadata {
         let mut reader = CompactReader::new(&self.footer, position as usize);
         let header = reader.read_list_header()?;
         if header.size() > 0 && header.element_type() != ElementType::Struct {
-            return Err(FooterError::InvalidValue {
-                structure: Structure::FileMetaData,
-                field: 7,
-                offset: position,
-            });
+            return Err(invalid_value(Structure::FileMetaData, 7, position));
         }
         if header.size() != self.column_count {
             return Err(FooterError::ColumnOrderCount {

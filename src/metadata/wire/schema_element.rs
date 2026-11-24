@@ -5,7 +5,9 @@ use crate::limits::Limits;
 use crate::metadata::errors::{FooterError, SchemaProblem, Structure};
 use crate::metadata::schema::{NodeData, Schema};
 use crate::metadata::types::{LogicalType, PhysicalType, Repetition, TimeUnit};
-use crate::metadata::utils::{Seen, footer_u32, offset, read_enum, read_str, read_u32};
+use crate::metadata::utils::{
+    Seen, footer_u32, invalid_value, offset, read_enum, read_str, read_u32,
+};
 use crate::thrift::{CompactReader, ElementType, FieldCursor, FieldType};
 
 /// Decodes the schema field of a footer: a list of `SchemaElement`.
@@ -22,11 +24,7 @@ pub(in crate::metadata) fn schema_decode(
         });
     }
     if header.element_type() != ElementType::Struct {
-        return Err(FooterError::InvalidValue {
-            structure: Structure::FileMetaData,
-            field: 2,
-            offset: list_offset,
-        });
+        return Err(invalid_value(Structure::FileMetaData, 2, list_offset));
     }
     let mut builder = Builder::new(
         limits.schema_depth_max(),
@@ -133,14 +131,10 @@ fn element_decode<'a>(reader: &mut CompactReader<'a>) -> Result<Element<'a>, Foo
 fn logical_type_decode(reader: &mut CompactReader<'_>) -> Result<LogicalType, FooterError> {
     // What is wrong with the union as a whole is reported against the field of the
     // schema element that holds it.
-    let invalid = FooterError::InvalidValue {
-        structure: Structure::SchemaElement,
-        field: 10,
-        offset: offset(reader),
-    };
+    let union_offset = offset(reader);
     let mut cursor = FieldCursor::default();
     let Some(member) = cursor.next(reader)? else {
-        return Err(invalid);
+        return Err(invalid_value(Structure::SchemaElement, 10, union_offset));
     };
     let logical_type = match (member.id(), member.field_type()) {
         (5, FieldType::Struct) => decimal_decode(reader)?,
@@ -169,7 +163,7 @@ fn logical_type_decode(reader: &mut CompactReader<'_>) -> Result<LogicalType, Fo
         }
     };
     if cursor.next(reader)?.is_some() {
-        return Err(invalid);
+        return Err(invalid_value(Structure::SchemaElement, 10, union_offset));
     }
     Ok(logical_type)
 }
@@ -227,24 +221,20 @@ fn time_decode(reader: &mut CompactReader<'_>) -> Result<(bool, TimeUnit), Foote
 
 /// Decodes a `TimeUnit`, a union of three empty structs.
 fn time_unit_decode(reader: &mut CompactReader<'_>) -> Result<TimeUnit, FooterError> {
-    let invalid = FooterError::InvalidValue {
-        structure: Structure::LogicalType,
-        field: 2,
-        offset: offset(reader),
-    };
+    let unit_offset = offset(reader);
     let mut cursor = FieldCursor::default();
     let Some(member) = cursor.next(reader)? else {
-        return Err(invalid);
+        return Err(invalid_value(Structure::LogicalType, 2, unit_offset));
     };
     let unit = match (member.id(), member.field_type()) {
         (1, FieldType::Struct) => TimeUnit::Milliseconds,
         (2, FieldType::Struct) => TimeUnit::Microseconds,
         (3, FieldType::Struct) => TimeUnit::Nanoseconds,
-        _ => return Err(invalid),
+        _ => return Err(invalid_value(Structure::LogicalType, 2, unit_offset)),
     };
     reader.skip(ElementType::Struct)?;
     if cursor.next(reader)?.is_some() {
-        return Err(invalid);
+        return Err(invalid_value(Structure::LogicalType, 2, unit_offset));
     }
     Ok(unit)
 }
@@ -262,11 +252,7 @@ fn integer_decode(reader: &mut CompactReader<'_>) -> Result<LogicalType, FooterE
                 seen.mark(STRUCTURE, 1, reader)?;
                 let value_offset = offset(reader);
                 let Ok(value) = u8::try_from(reader.read_i8()?) else {
-                    return Err(FooterError::InvalidValue {
-                        structure: STRUCTURE,
-                        field: 1,
-                        offset: value_offset,
-                    });
+                    return Err(invalid_value(STRUCTURE, 1, value_offset));
                 };
                 bit_width = value;
             }

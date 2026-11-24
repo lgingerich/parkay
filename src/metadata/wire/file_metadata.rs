@@ -11,7 +11,7 @@ use crate::metadata::errors::{FooterError, Structure, Unsupported};
 use crate::metadata::schema::Schema;
 use crate::metadata::template::{Templates, chunks_parse};
 use crate::metadata::types::ColumnOrder;
-use crate::metadata::utils::{Seen, offset, read_u64};
+use crate::metadata::utils::{Seen, invalid_value, missing_field, offset, read_u64};
 use crate::thrift::{CompactReader, ElementType, Field, FieldCursor, FieldType};
 
 /// What the footer says about one row group as a whole.
@@ -144,11 +144,6 @@ impl<'a> Pass<'a> {
         FieldCursor::after(2)
     }
 
-    /// Whether the schema was taken from the one supplied instead of decoded.
-    const fn schema_is_shared(&self) -> bool {
-        self.schema.is_none() && self.seen.contains(2)
-    }
-
     /// Handles one top-level field of the footer.
     fn field(&mut self, field: Field) -> Result<(), FooterError> {
         const STRUCTURE: Structure = Pass::STRUCTURE;
@@ -223,11 +218,7 @@ impl<'a> Pass<'a> {
         let list_offset = offset(&self.reader);
         let header = self.reader.read_list_header()?;
         if header.size() > 0 && header.element_type() != ElementType::Struct {
-            return Err(FooterError::InvalidValue {
-                structure: Pass::STRUCTURE,
-                field: 4,
-                offset: list_offset,
-            });
+            return Err(invalid_value(Pass::STRUCTURE, 4, list_offset));
         }
         let input_left = self.footer.len() - self.reader.position();
         self.templates = Templates::for_row_groups(input_left, header.size());
@@ -246,9 +237,6 @@ impl<'a> Pass<'a> {
             let chunk_count_max = row_group_count.saturating_mul(chunk_count as usize);
             self.chunk_positions
                 .reserve_exact(chunk_count_max.min(input_left));
-        } else {
-            // The schema comes after the row groups, which no known writer does. The
-            // directory then grows as the row groups are read.
         }
         for index in 0..header.size() {
             self.row_group_decode(index)?;
@@ -291,11 +279,7 @@ impl<'a> Pass<'a> {
         let header = self.reader.read_list_header()?;
         let found = header.size();
         if found > 0 && header.element_type() != ElementType::Struct {
-            return Err(FooterError::InvalidValue {
-                structure: Structure::RowGroup,
-                field: 1,
-                offset: list_offset,
-            });
+            return Err(invalid_value(Structure::RowGroup, 1, list_offset));
         }
         let expected = *self.chunk_count.get_or_insert(found);
         if found != expected {
@@ -306,8 +290,7 @@ impl<'a> Pass<'a> {
             });
         }
         // The list's size was checked against the input left, and a chunk is at least a
-        // byte, so this reserves at most four bytes for each byte of footer.
-        self.chunk_positions.reserve(found as usize);
+        // byte, so this grows by at most four bytes for each byte of footer.
         let first = self.chunk_positions.len();
         self.chunk_positions.resize(first + found as usize, 0);
         let chunk_positions = &mut self.chunk_positions[first..];
@@ -332,17 +315,12 @@ impl<'a> Pass<'a> {
         let column_count = match (&self.schema, schema_shared) {
             (Some(schema), _) => schema.column_count(),
             (None, Some(schema)) => {
-                debug_assert!(self.schema_is_shared());
+                debug_assert!(self.seen.contains(2));
                 schema.column_count()
             }
             // Field 2 was seen, so the schema was decoded or taken from the one
             // supplied.
-            (None, None) => {
-                return Err(FooterError::MissingField {
-                    structure: STRUCTURE,
-                    field: 2,
-                });
-            }
+            (None, None) => return Err(missing_field(STRUCTURE, 2)),
         };
         // Row groups that came before the schema were checked against each other.
         if let Some(found) = self.chunk_count
@@ -390,11 +368,7 @@ pub(in crate::metadata) fn column_order_decode(
     };
     reader.skip_field(member.field_type())?;
     if cursor.next(reader)?.is_some() {
-        return Err(FooterError::InvalidValue {
-            structure: Structure::ColumnOrder,
-            field: 1,
-            offset: union_offset,
-        });
+        return Err(invalid_value(Structure::ColumnOrder, 1, union_offset));
     }
     Ok(column_order)
 }

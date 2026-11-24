@@ -33,7 +33,7 @@
 //! no state, and `mod.rs` is everything that has: the templates, what they may cost,
 //! and the loops.
 //!
-//! The design is in `docs/design-notes.md`, section "Metadata".
+//! The design is in `docs/subsystems/metadata.md`.
 
 mod errors;
 mod extract;

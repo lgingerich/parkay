@@ -45,11 +45,7 @@ impl Seen {
         debug_assert!(field <= FIELD_ID_MAX);
         let bit = 1_u32 << field;
         if self.0 & bit != 0 {
-            return Err(FooterError::DuplicateField {
-                structure,
-                field,
-                offset: offset(reader),
-            });
+            return Err(duplicate_field(structure, field, offset(reader)));
         }
         self.0 |= bit;
         Ok(())
@@ -71,8 +67,40 @@ impl Seen {
         if self.contains(field) {
             Ok(())
         } else {
-            Err(FooterError::MissingField { structure, field })
+            Err(missing_field(structure, field))
         }
+    }
+}
+
+#[cold]
+pub(super) const fn duplicate_field(structure: Structure, field: u8, offset: u32) -> FooterError {
+    FooterError::DuplicateField {
+        structure,
+        field,
+        offset,
+    }
+}
+
+#[cold]
+pub(super) const fn missing_field(structure: Structure, field: u8) -> FooterError {
+    FooterError::MissingField { structure, field }
+}
+
+#[cold]
+pub(super) const fn invalid_value(structure: Structure, field: u8, offset: u32) -> FooterError {
+    FooterError::InvalidValue {
+        structure,
+        field,
+        offset,
+    }
+}
+
+#[cold]
+const fn invalid_utf8(structure: Structure, field: u8, offset: u32) -> FooterError {
+    FooterError::InvalidUtf8 {
+        structure,
+        field,
+        offset,
     }
 }
 
@@ -90,6 +118,11 @@ pub(super) fn footer_u32(value: usize) -> u32 {
 
 /// Reads an `i64` field that holds a count, a size, or an offset, none of which can be
 /// negative.
+// Note: inlined because extraction reads up to eight of these per column chunk, and out
+// of line each returned its result through memory. A plain `#[inline]` was not taken.
+// Measured 2% faster on `open_all` for `wide` and `many_row_groups`; the varint decode
+// it calls stays out of line, and is most of what remains.
+#[inline(always)]
 pub(super) fn read_u64(
     reader: &mut CompactReader<'_>,
     structure: Structure,
@@ -98,11 +131,7 @@ pub(super) fn read_u64(
     let offset = offset(reader);
     let value = reader.read_i64()?;
     let Ok(value) = u64::try_from(value) else {
-        return Err(FooterError::InvalidValue {
-            structure,
-            field,
-            offset,
-        });
+        return Err(invalid_value(structure, field, offset));
     };
     Ok(value)
 }
@@ -116,11 +145,7 @@ pub(super) fn read_u32(
     let offset = offset(reader);
     let value = reader.read_i32()?;
     let Ok(value) = u32::try_from(value) else {
-        return Err(FooterError::InvalidValue {
-            structure,
-            field,
-            offset,
-        });
+        return Err(invalid_value(structure, field, offset));
     };
     Ok(value)
 }
@@ -134,11 +159,7 @@ pub(super) fn read_str<'a>(
     let offset = offset(reader);
     let bytes = reader.read_binary()?;
     let Ok(text) = str::from_utf8(bytes) else {
-        return Err(FooterError::InvalidUtf8 {
-            structure,
-            field,
-            offset,
-        });
+        return Err(invalid_utf8(structure, field, offset));
     };
     Ok(text)
 }
@@ -154,11 +175,7 @@ pub(super) fn read_enum<T>(
     let offset = offset(reader);
     let code = reader.read_i32()?;
     let Some(value) = from_code(code) else {
-        return Err(FooterError::InvalidValue {
-            structure,
-            field,
-            offset,
-        });
+        return Err(invalid_value(structure, field, offset));
     };
     Ok(value)
 }

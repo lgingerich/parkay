@@ -1986,24 +1986,49 @@ fn an_integer_that_has_grown_replaces_the_template_when_many_row_groups_follow()
 
 #[test]
 fn a_template_with_no_room_for_more_varying_lengths_is_replaced() {
-    // The second chunk differs from the first in the lengths of its two sizes, its
-    // offset, and its two bounds: one more than a template remembers.
+    let chunk_with_fields = |group_a_large: bool, group_b_large: bool| {
+        let a_int = if group_a_large { 1_100_000 } else { 50 };
+        let a_bound: &[u8] = if group_a_large {
+            b"a bound much longer than the first"
+        } else {
+            b"aa"
+        };
+        let b_int = if group_b_large { 1_100_000 } else { 50 };
+        let mut metadata = column_metadata(a_int, a_int);
+        metadata[4] = (5, Value::I64(b_int)); // num_values
+        metadata.push((10, Value::I64(b_int))); // index_page_offset
+        metadata.push((
+            12,
+            Value::Struct(vec![
+                (3, Value::I64(b_int)),
+                (5, Value::Binary(a_bound.to_vec())),
+                (6, Value::Binary(a_bound.to_vec())),
+            ]),
+        ));
+        Value::Struct(vec![(2, Value::I64(b_int)), (3, Value::Struct(metadata))])
+    };
+    // Chunk 1 differs in 5 fields (uncompressed/compressed sizes, data offset, both
+    // bounds), which fits in the template. Chunk 2 differs in 4 other fields
+    // (file_offset, num_values, index_page_offset, null_count): 9 total, one more than
+    // a template remembers, so chunk 2 replaces the template.
     let chunks = [
-        chunk_sized(100, 50, b"aa"),
-        chunk_sized(1_100_000, 1_100_000, b"a bound much longer than the first"),
-        chunk_sized(1_200_000, 1_200_000, b"a bound just as long as the second"),
-        chunk_sized(1_300_000, 1_300_000, b"a bound just as long as the others"),
+        chunk_with_fields(false, false),
+        chunk_with_fields(true, false),
+        chunk_with_fields(false, true),
+        chunk_with_fields(false, true),
     ];
     let (bytes, bounds) = laid_out(&chunks);
     let mut templates = Templates::new(1 << 20, 4);
     for (index, bound) in bounds.windows(2).enumerate() {
         templates.row_group_begin();
         assert_eq!(templates.chunk_end(0, &bytes, bound[0]), Ok(bound[1]));
-        // From the second chunk on, the second chunk is the template, and the chunks
-        // after it are like it.
-        let template = bounds[index.min(1)];
-        assert_eq!(templates.template_start(0), Some(template));
-        assert_eq!(templates.variable_count(0), 0);
+        let (expected_template, expected_variables) = match index {
+            0 => (bounds[0], 0),
+            1 => (bounds[0], 5),
+            _ => (bounds[2], 0),
+        };
+        assert_eq!(templates.template_start(0), Some(expected_template));
+        assert_eq!(templates.variable_count(0), expected_variables);
     }
     assert_eq!(templates.hit_count(0), 3);
     assert_eq!(templates.miss_count(0), 0);
@@ -2061,22 +2086,36 @@ fn a_column_that_never_matches_gets_no_second_template_unless_matches_pay_for_it
     assert!(!templates.has_template(0));
 }
 
-#[test]
-fn a_column_that_keeps_changing_stops_being_compared() {
-    // The first column's chunks are alike, and its matches pay for templates. The
-    // second column's chunks change in every row group.
+/// Ten row groups of two columns. The first column's chunks are alike, and its matches
+/// pay for templates. The second column's chunks cycle through `shapes`, one shape for
+/// each row group.
+fn passed_over_with_changing_column(shapes: &[Value]) -> Templates {
     let chunks: Vec<Value> = (0..10)
-        .flat_map(|row_group| {
-            let changing = if row_group % 2 == 0 {
-                chunk_bounded(100, b"aa")
-            } else {
-                chunk_with_dictionary(100)
-            };
-            [chunk_bounded(100 + row_group, b"aa"), changing]
-        })
+        .zip(shapes.iter().cycle())
+        .flat_map(|(row_group, changing)| [chunk_bounded(100 + row_group, b"aa"), changing.clone()])
         .collect();
     let templates = passed_over_in_pairs(&chunks);
     assert_eq!(templates.hit_count(0), 9);
+    templates
+}
+
+#[test]
+fn a_column_that_alternates_between_two_shapes_matches_both() {
+    let shapes = [chunk_bounded(100, b"aa"), chunk_with_dictionary(100)];
+    let templates = passed_over_with_changing_column(&shapes);
+    // The second shape missed once and was built; from then on each matches.
+    assert_eq!(templates.hit_count(1), 8);
+    assert_eq!(templates.miss_count(1), 1);
+}
+
+#[test]
+fn a_column_that_keeps_changing_stops_being_compared() {
+    let shapes = [
+        chunk_bounded(100, b"aa"),
+        chunk_with_dictionary(100),
+        chunk(column_metadata(100, 50)),
+    ];
+    let templates = passed_over_with_changing_column(&shapes);
     // Three chunks were compared and differed. After that none was compared.
     assert_eq!(templates.hit_count(1), 0);
     assert_eq!(templates.miss_count(1), 3);
@@ -2085,13 +2124,14 @@ fn a_column_that_keeps_changing_stops_being_compared() {
 
 #[test]
 fn templates_cost_no_more_than_their_credit() {
-    // Two columns in four row groups. The grant is an eighth of these bytes, which
-    // one template uses up.
+    // Two columns in four row groups. Giving the templates a remaining footer budget of
+    // two chunks grants one chunk of initial credit (half), which the first template
+    // uses up.
     let chunks: Vec<Value> = (0..8)
-        .map(|index| chunk_bounded(100 + index, b"aa"))
+        .map(|index| chunk_bounded(100 + index, &[b'a'; 60]))
         .collect();
     let (bytes, bounds) = laid_out(&chunks);
-    let mut templates = Templates::new(bytes.len(), 4);
+    let mut templates = Templates::new(bounds[1] * 2, 4);
     let row_group = |passing: &mut Templates, first: usize| {
         passing.row_group_begin();
         for column in 0..2 {

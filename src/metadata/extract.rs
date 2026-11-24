@@ -8,9 +8,9 @@
 
 use std::ops::Range;
 
-use super::errors::{ExtractError, FooterError};
+use super::errors::ExtractError;
 use super::file::Metadata;
-use super::types::{Location, Statistics, Wanted};
+use super::types::{Location, Statistics};
 use super::wire::column_chunk::{Chunk, column_chunk_decode};
 
 /// Which leaf columns a [`Request`] covers.
@@ -60,34 +60,6 @@ impl<'a> Request<'a> {
     pub const fn with_statistics(mut self) -> Self {
         self.statistics = true;
         self
-    }
-
-    pub(super) const fn columns(&self) -> Columns<'a> {
-        self.columns
-    }
-
-    pub(super) const fn row_group_start(&self) -> u32 {
-        self.row_group_start
-    }
-
-    pub(super) const fn row_group_end(&self) -> u32 {
-        self.row_group_end
-    }
-
-    /// The fields of `ColumnMetaData` this request needs.
-    pub(super) const fn wanted(&self) -> Wanted {
-        let mut fields = 0;
-        if self.location {
-            fields |= Wanted::LOCATION;
-        }
-        if self.statistics {
-            fields |= Wanted::STATISTICS;
-        }
-        Wanted {
-            fields,
-            location: self.location,
-            statistics: self.statistics,
-        }
     }
 }
 
@@ -189,55 +161,34 @@ impl ChunkFacts {
 
     fn index(&self, slot: ChunkSlot) -> Option<usize> {
         if slot.row_group < self.row_group_count && slot.column < self.column_count {
-            let row_group = slot.row_group as usize;
-            Some(row_group * self.column_count as usize + slot.column as usize)
+            (slot.row_group as usize)
+                .checked_mul(self.column_count as usize)?
+                .checked_add(slot.column as usize)
         } else {
             None
         }
     }
 
-    /// Empties the storage and sizes it for `chunk_count` chunks of the groups `wanted`
-    /// names. Nothing can be read from it until [`Self::complete`] is called, so a
+    /// Empties the storage and sizes it for `chunk_count` chunks of the requested
+    /// groups. Nothing can be read from it until [`Self::complete`] is called, so a
     /// failed extraction leaves no facts behind, old or new.
-    pub(super) fn prepare(&mut self, chunk_count: usize, wanted: Wanted) {
+    fn prepare(&mut self, chunk_count: usize, want_location: bool, want_statistics: bool) {
         self.row_group_count = 0;
         self.column_count = 0;
-        // `resize` writes only the entries it adds. Every entry is written again when
-        // its chunk is decoded.
-        let location_count = if wanted.location { chunk_count } else { 0 };
-        let statistics_count = if wanted.statistics { chunk_count } else { 0 };
-        self.locations.resize(location_count, Location::EMPTY);
-        self.statistics.resize(statistics_count, Statistics::EMPTY);
+        // `resize` writes only the entries it adds. Every entry is overwritten when its
+        // chunk is decoded.
+        self.locations
+            .resize(if want_location { chunk_count } else { 0 }, Location::EMPTY);
+        self.statistics.resize(
+            if want_statistics { chunk_count } else { 0 },
+            Statistics::EMPTY,
+        );
     }
 
     /// Makes the facts readable, once every chunk has been decoded.
-    pub(super) const fn complete(&mut self, row_group_count: u32, column_count: u32) {
+    const fn complete(&mut self, row_group_count: u32, column_count: u32) {
         self.row_group_count = row_group_count;
         self.column_count = column_count;
-    }
-
-    /// Decodes the chunk at `position` in `footer` into the entry at `index`.
-    pub(super) fn chunk_decode(
-        &mut self,
-        index: usize,
-        chunk: Chunk<'_>,
-        wanted: Wanted,
-    ) -> Result<(), FooterError> {
-        // A group that was not requested has no storage; its fields are never decoded,
-        // and these stand in so the decoder has one shape.
-        let mut location_unused = Location::EMPTY;
-        let mut statistics_unused = Statistics::EMPTY;
-        let location = self
-            .locations
-            .get_mut(index)
-            .unwrap_or(&mut location_unused);
-        let statistics = self
-            .statistics
-            .get_mut(index)
-            .unwrap_or(&mut statistics_unused);
-        *location = Location::EMPTY;
-        *statistics = Statistics::EMPTY;
-        column_chunk_decode(chunk, wanted, location, statistics)
     }
 }
 
@@ -257,7 +208,7 @@ impl Metadata {
         request: &Request<'_>,
         facts: &mut ChunkFacts,
     ) -> Result<(), ExtractError> {
-        let row_groups = request.row_group_start()..request.row_group_end();
+        let row_groups = request.row_group_start..request.row_group_end;
         let row_group_count = self.row_group_count();
         if row_groups.start > row_groups.end || row_groups.end > row_group_count {
             return Err(ExtractError::RowGroups {
@@ -266,12 +217,8 @@ impl Metadata {
                 count: row_group_count,
             });
         }
-        let wanted = request.wanted();
-        match request.columns() {
-            Columns::All => {
-                let columns = 0..self.column_count;
-                self.extract_columns(row_groups, &columns, self.column_count, wanted, facts)
-            }
+        let column_count = match request.columns {
+            Columns::All => self.column_count,
             Columns::Indices(columns) => {
                 if let Some(&column) = columns.iter().find(|&&column| column >= self.column_count) {
                     return Err(ExtractError::Column {
@@ -285,41 +232,87 @@ impl Metadata {
                         count: self.column_count,
                     });
                 };
-                let columns = columns.iter().copied();
-                self.extract_columns(row_groups, &columns, column_count, wanted, facts)
+                column_count
+            }
+        };
+        match (request.location, request.statistics) {
+            (true, true) => {
+                self.extract_mode::<true, true>(row_groups, request.columns, column_count, facts)
+            }
+            (true, false) => {
+                self.extract_mode::<true, false>(row_groups, request.columns, column_count, facts)
+            }
+            (false, true) => {
+                self.extract_mode::<false, true>(row_groups, request.columns, column_count, facts)
+            }
+            (false, false) => {
+                self.extract_mode::<false, false>(row_groups, request.columns, column_count, facts)
             }
         }
     }
 
-    /// Decodes the chunks of `columns` in `row_groups`, row group by row group, in the
-    /// order they are in the footer.
-    fn extract_columns(
+    /// Decodes the requested chunks, specialized by which fact groups are wanted.
+    fn extract_mode<const WANT_LOCATION: bool, const WANT_STATISTICS: bool>(
         &self,
         row_groups: Range<u32>,
-        columns: &(impl Iterator<Item = u32> + Clone),
+        columns: Columns<'_>,
         column_count: u32,
-        wanted: Wanted,
         facts: &mut ChunkFacts,
     ) -> Result<(), ExtractError> {
         let row_group_count = row_groups.end - row_groups.start;
-        facts.prepare(row_group_count as usize * column_count as usize, wanted);
+        let chunk_count = (row_group_count as usize)
+            .checked_mul(column_count as usize)
+            .ok_or(ExtractError::Column {
+                column: u32::MAX,
+                count: self.column_count,
+            })?;
+        facts.prepare(chunk_count, WANT_LOCATION, WANT_STATISTICS);
+        let file_columns = self.column_count as usize;
         let mut index = 0;
+        let mut decode = |row_group: u32, column: u32, position: u32| -> Result<(), ExtractError> {
+            let mut location_unused = Location::EMPTY;
+            let mut statistics_unused = Statistics::EMPTY;
+            let location = if WANT_LOCATION {
+                &mut facts.locations[index]
+            } else {
+                &mut location_unused
+            };
+            let statistics = if WANT_STATISTICS {
+                &mut facts.statistics[index]
+            } else {
+                &mut statistics_unused
+            };
+            let chunk = Chunk {
+                footer: &self.footer,
+                position,
+                file_size: self.file_size,
+            };
+            index += 1;
+            column_chunk_decode::<WANT_LOCATION, WANT_STATISTICS>(chunk, location, statistics)
+                .map_err(|source| ExtractError::ColumnChunk {
+                    row_group,
+                    column,
+                    source,
+                })
+        };
         for row_group in row_groups {
-            let first = row_group as usize * self.column_count as usize;
-            for column in columns.clone() {
-                let chunk = Chunk {
-                    footer: &self.footer,
-                    position: self.chunk_positions[first + column as usize],
-                    file_size: self.file_size,
-                };
-                if let Err(source) = facts.chunk_decode(index, chunk, wanted) {
-                    return Err(ExtractError::ColumnChunk {
-                        row_group,
-                        column,
-                        source,
-                    });
+            let first = row_group as usize * file_columns;
+            let positions = &self.chunk_positions[first..first + file_columns];
+            match columns {
+                Columns::All => {
+                    for (col_index, &position) in positions.iter().enumerate() {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "col_index < file_columns which fits in u32"
+                        )]
+                        decode(row_group, col_index as u32, position)?;
+                    }
                 }
-                index += 1;
+                Columns::Indices(indices) => {
+                    for &column in indices {
+                        decode(row_group, column, positions[column as usize])?;
+                    }
+                }
             }
         }
         facts.complete(row_group_count, column_count);

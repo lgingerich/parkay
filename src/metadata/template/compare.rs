@@ -6,20 +6,17 @@
 //! does it end? The argument that a match is sound is on [`matched_end`].
 
 use super::Template;
-use crate::metadata::utils::footer_u32;
 use crate::thrift::{CompactReader, Marks};
 
-/// The most lengths a template remembers as varying. A string column's statistics
-/// have two to four, and a file offset that has grown a byte is one more.
-// Note: reasoned from what a column chunk holds, and not compared with other values.
-// Each one adds eight bytes to every column's template.
-pub(super) const VARIABLE_COUNT_MAX: usize = 4;
+/// The most lengths a template remembers as varying. A string column's statistics can
+/// have four binary bounds alongside varying sizes and null counts; packing [`Variable`]
+/// into `u16` offsets fits eight entries in a 64-byte [`Template`] (measured 20–33%
+/// faster on `medium` and `many_row_groups` `open` than four).
+pub(super) const VARIABLE_COUNT_MAX: usize = 8;
 
 /// The most lengths that may differ between a chunk and its template before the chunk
 /// is parsed instead. Each costs about as much as parsing a field, so beyond a few the
 /// comparison saves little.
-// Note: reasoned, and not compared with other values. It only decides between two slow
-// paths: comparing twice, or parsing.
 pub(super) const RESYNC_COUNT_MAX: usize = 8;
 
 const _: () = assert!(VARIABLE_COUNT_MAX <= RESYNC_COUNT_MAX);
@@ -31,9 +28,9 @@ const _: () = assert!(VARIABLE_COUNT_MAX <= u8::MAX as usize);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Variable {
     /// Where the integer, or the binary's length, starts in the template chunk.
-    pub(super) start: u32,
+    pub(super) start: u16,
     /// Where the integer, or the binary's contents, ends in the template chunk.
-    pub(super) end: u32,
+    pub(super) end: u16,
 }
 
 /// Where the chunk that starts at `start` ends, if it matches `template`: it agrees
@@ -43,6 +40,9 @@ pub(super) struct Variable {
 /// Such a chunk is parsed by the same steps as the template chunk: the marked bits
 /// decide every step, and a step that passes over an integer or a binary takes any
 /// length of one.
+// Note: inlined into `Run::pass` so its hot loop stays register-resident; out of line
+// cost ~20% on `many_row_groups/open`.
+#[inline(always)]
 pub(super) fn matched_end(
     template: &Template,
     footer: &[u8],
@@ -51,7 +51,6 @@ pub(super) fn matched_end(
 ) -> Option<usize> {
     let size = template.size as usize;
     if size == 0 {
-        // The column has no template.
         return None;
     }
     let template_bytes = footer.get(template.position as usize..)?.get(..size)?;
@@ -60,8 +59,7 @@ pub(super) fn matched_end(
     let mut template_offset = 0;
     let mut position = start;
     for variable in template.variables() {
-        let variable_start = variable.start as usize;
-        // The stretch before the variable, which must agree.
+        let variable_start = usize::from(variable.start);
         let fixed_size = variable_start.checked_sub(template_offset)?;
         let fixed = Compared {
             template: template_bytes.get(template_offset..variable_start)?,
@@ -78,7 +76,7 @@ pub(super) fn matched_end(
         } else {
             binary_end(footer, candidate_variable)?
         };
-        template_offset = variable.end as usize;
+        template_offset = usize::from(variable.end);
     }
     let rest_size = size.checked_sub(template_offset)?;
     let rest = Compared {
@@ -91,11 +89,11 @@ pub(super) fn matched_end(
 
 /// A place in a comparison of a candidate chunk with a template.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Place {
+struct Place {
     /// Bytes of the template compared or stepped over so far.
-    pub(super) template_offset: usize,
+    template_offset: usize,
     /// The position in the footer of the candidate's byte that comes next.
-    pub(super) candidate_position: usize,
+    candidate_position: usize,
 }
 
 /// What a comparison that stepped over every length it found to differ came to.
@@ -104,9 +102,9 @@ pub(super) struct Stepped {
     /// Where the chunk ends.
     pub(super) end: usize,
     /// The stretches of the template that were stepped over, in order.
-    pub(super) variables: [Variable; RESYNC_COUNT_MAX],
+    variables: [Variable; RESYNC_COUNT_MAX],
     /// How many of `variables` are in use.
-    pub(super) variable_count: usize,
+    variable_count: usize,
     /// Whether an integer of the chunk is longer than the template's.
     pub(super) integer_grew: bool,
 }
@@ -171,13 +169,13 @@ pub(super) fn stepped_end(
         };
         let step = step_over(template, footer, marks, difference)?;
         // Every round steps over at least the byte that differed.
-        debug_assert!(step.variable.end as usize > difference.template_offset);
-        debug_assert!(step.variable.end as usize <= size);
+        debug_assert!(usize::from(step.variable.end) > difference.template_offset);
+        debug_assert!(usize::from(step.variable.end) <= size);
         *stepped.variables.get_mut(stepped.variable_count)? = step.variable;
         stepped.variable_count += 1;
         stepped.integer_grew |= step.integer_grew;
         place = Place {
-            template_offset: step.variable.end as usize,
+            template_offset: usize::from(step.variable.end),
             candidate_position: step.candidate_position,
         };
     }
@@ -188,9 +186,9 @@ struct Step {
     /// The stretch of the template that holds the integer or binary.
     variable: Variable,
     /// Where the candidate goes on after its own.
-    pub(super) candidate_position: usize,
+    candidate_position: usize,
     /// Whether it is an integer that is longer in the candidate.
-    pub(super) integer_grew: bool,
+    integer_grew: bool,
 }
 
 /// Steps over the integer or binary that the two chunks differ in at `difference`.
@@ -216,8 +214,8 @@ fn step_over(template: &Template, footer: &[u8], marks: &Marks, difference: Plac
         let template_end = varint_end(footer, template_at)?;
         return Some(Step {
             variable: Variable {
-                start: footer_u32(difference.template_offset - continued),
-                end: footer_u32(template_end - template_start),
+                start: u16::try_from(difference.template_offset - continued).ok()?,
+                end: u16::try_from(template_end - template_start).ok()?,
             },
             candidate_position: varint_end(footer, difference.candidate_position)?,
             // The template's integer ends at the byte that differs, so the
@@ -245,8 +243,8 @@ fn step_over(template: &Template, footer: &[u8], marks: &Marks, difference: Plac
     }
     Some(Step {
         variable: Variable {
-            start: footer_u32(template_binary - template_start),
-            end: footer_u32(binary_end(footer, template_binary)? - template_start),
+            start: u16::try_from(template_binary - template_start).ok()?,
+            end: u16::try_from(binary_end(footer, template_binary)? - template_start).ok()?,
         },
         candidate_position: binary_end(footer, candidate_binary)?,
         integer_grew: false,
@@ -255,21 +253,26 @@ fn step_over(template: &Template, footer: &[u8], marks: &Marks, difference: Plac
 
 /// Three runs of bytes of one length: a stretch of a template chunk, its mask, and the
 /// stretch of a chunk being compared with it.
-pub(super) struct Compared<'a> {
-    pub(super) template: &'a [u8],
-    pub(super) mask: &'a [u8],
-    pub(super) candidate: &'a [u8],
+struct Compared<'a> {
+    template: &'a [u8],
+    mask: &'a [u8],
+    candidate: &'a [u8],
 }
 
 impl Compared<'_> {
     /// Whether the candidate agrees with the template on every bit that is set in the
     /// mask.
-    pub(super) fn agrees(&self) -> bool {
-        debug_assert_eq!(self.template.len(), self.mask.len());
-        debug_assert_eq!(self.candidate.len(), self.mask.len());
-        let (template_words, _) = self.template.as_chunks::<8>();
-        let (mask_words, _) = self.mask.as_chunks::<8>();
-        let (candidate_words, _) = self.candidate.as_chunks::<8>();
+    #[inline(always)]
+    fn agrees(&self) -> bool {
+        let len = self.mask.len();
+        debug_assert_eq!(self.template.len(), len);
+        debug_assert_eq!(self.candidate.len(), len);
+        let template = &self.template[..len];
+        let mask = &self.mask[..len];
+        let candidate = &self.candidate[..len];
+        let (template_words, _) = template.as_chunks::<8>();
+        let (mask_words, _) = mask.as_chunks::<8>();
+        let (candidate_words, _) = candidate.as_chunks::<8>();
         // Differences are gathered and tested once at the end, so the loop has no
         // branch in it.
         let mut difference = 0;
@@ -279,20 +282,18 @@ impl Compared<'_> {
                 ^ u64::from_le_bytes(*candidate_word))
                 & u64::from_le_bytes(*mask_word);
         }
-        let last_words = (
-            self.template.last_chunk::<8>(),
-            self.mask.last_chunk::<8>(),
-            self.candidate.last_chunk::<8>(),
-        );
-        if let (Some(template_word), Some(mask_word), Some(candidate_word)) = last_words {
+        if let Some(tail) = len.checked_sub(8) {
             // The last word, which overlaps the words above unless they left nothing
             // over. Comparing some bytes twice costs less than a loop over the rest.
-            difference |= (u64::from_le_bytes(*template_word)
-                ^ u64::from_le_bytes(*candidate_word))
-                & u64::from_le_bytes(*mask_word);
+            let word = |slice: &[u8]| -> u64 {
+                slice[tail..]
+                    .first_chunk::<8>()
+                    .map_or(0, |chunk| u64::from_le_bytes(*chunk))
+            };
+            difference |= (word(template) ^ word(candidate)) & word(mask);
         } else {
             // Shorter than a word.
-            let bytes = self.template.iter().zip(self.mask).zip(self.candidate);
+            let bytes = template.iter().zip(mask).zip(candidate);
             for ((template_byte, mask_byte), candidate_byte) in bytes {
                 difference |= u64::from((template_byte ^ candidate_byte) & mask_byte);
             }
@@ -332,7 +333,8 @@ impl Compared<'_> {
 
 /// Where the varint that holds the byte at `position` ends: after its first byte, from
 /// there on, without a continuation bit. `None` if the footer ends first.
-pub(super) fn varint_end(footer: &[u8], position: usize) -> Option<usize> {
+#[inline(always)]
+fn varint_end(footer: &[u8], position: usize) -> Option<usize> {
     // What `skip` does for an integer, without a reader: this runs for every length
     // that varies in every chunk compared.
     let last = footer
@@ -344,7 +346,22 @@ pub(super) fn varint_end(footer: &[u8], position: usize) -> Option<usize> {
 
 /// Where the binary whose length starts at `position` ends. `None` if its length is
 /// not valid or it does not fit in the footer.
-pub(super) fn binary_end(footer: &[u8], position: usize) -> Option<usize> {
+#[inline(always)]
+fn binary_end(footer: &[u8], position: usize) -> Option<usize> {
+    // Nearly all column-chunk binaries (min/max bounds, column paths) are under 128
+    // bytes, so their length is a single varint byte. Handling that inline avoids a
+    // call and register spills in `Run::pass`.
+    let byte = *footer.get(position)?;
+    if byte < 0x80 {
+        let end = position + 1 + usize::from(byte);
+        return (end <= footer.len()).then_some(end);
+    }
+    binary_end_long(footer, position)
+}
+
+/// Multi-byte binary length slow path for [`binary_end`].
+#[cold]
+fn binary_end_long(footer: &[u8], position: usize) -> Option<usize> {
     let mut reader = CompactReader::new(footer, position);
     reader.read_binary().ok()?;
     Some(reader.position())

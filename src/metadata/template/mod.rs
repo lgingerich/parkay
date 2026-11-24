@@ -17,6 +17,10 @@
 //! remembers which of its lengths vary, so that later chunks are compared around them
 //! without being stopped by them.
 //!
+//! A column whose chunks alternate between two shapes (such as all-null and non-null
+//! row groups) keeps its previous template in an alternate slot so both shapes match
+//! without reparsing.
+//!
 //! Whatever the comparison cannot settle is parsed as before, so this accepts and
 //! rejects exactly what parsing does. Debug builds, the tests, and the fuzz targets
 //! parse every chunk that matched and check that it ends where the comparison said.
@@ -45,11 +49,16 @@ struct Template {
     hits: u32,
     /// Chunks of the column that were compared with a template and did not match.
     misses: u32,
+    /// One-based index into [`Templates::alternates`] for a column's previous template,
+    /// or zero if it has none. Always zero for entries stored inside `alternates`.
+    alternate: u16,
     /// How many of `variables` are in use.
     variable_count: u8,
     /// The stretches of the template whose lengths vary, in order.
     variables: [Variable; VARIABLE_COUNT_MAX],
 }
+
+const _: () = assert!(size_of::<Template>() == 64);
 
 impl Template {
     const NONE: Self = Self {
@@ -60,13 +69,12 @@ impl Template {
         binaries_count: 0,
         hits: 0,
         misses: 0,
+        alternate: 0,
         variable_count: 0,
         variables: [Variable { start: 0, end: 0 }; VARIABLE_COUNT_MAX],
     };
 
     /// Misses before a column is judged. Below this it has not been seen enough.
-    // Note: a judgment, and not compared with other values. What it risks is small
-    // either way: matches must pay for every template after a column's first.
     const MISSES_MIN: u32 = 3;
 
     /// Whether the column's chunks have differed from their templates too often for
@@ -140,15 +148,10 @@ struct Budget {
 
 impl Budget {
     /// The credit granted is the footer's remaining length divided by this: enough for
-    /// a template for every column when there are at least this many row groups.
-    /// Marking costs about a fifth more than parsing (`docs/perf/open.md`), so a
-    /// footer in which nothing matches is passed over about one part in forty slower
-    /// at the worst.
-    // Note: the bound is measured: on the fixture where nothing matches, opening takes
-    // the same time with and without templates. Other divisors have not been compared.
-    // A smaller one gives more columns a template in the first row group of a file
-    // with few row groups, and raises the worst case in proportion.
-    const CREDIT_DIVISOR: usize = 8;
+    /// a template for every column even in a two-row-group file. Because the grant may
+    /// only pay for a column's first template, files with many row groups still spend
+    /// at most one row group's worth of grant when nothing matches.
+    const CREDIT_DIVISOR: usize = 2;
 
     /// The budget for a list of row groups that takes up at most `footer_size_left`
     /// bytes.
@@ -197,11 +200,16 @@ impl Budget {
 pub(super) struct Templates {
     /// One for each column, in order. Filled as the first row group is passed over.
     columns: Vec<Template>,
+    /// Previous templates parked by columns that changed shape, indexed by
+    /// `Template::alternate - 1`.
+    alternates: Vec<Template>,
     /// The marks of every template built, one after another.
     marks: Marks,
     /// What building templates may still cost.
     budget: Budget,
-    /// The most bytes of mask to keep.
+    /// The most bytes of mask to keep. Bounded by `footer_size_left` so mask memory
+    /// stays proportional to the footer while leaving room for templates paid by
+    /// earned credit after the initial grant is spent.
     mask_size_max: usize,
     /// The most columns to keep a template for.
     column_count_max: usize,
@@ -225,26 +233,13 @@ impl Templates {
 
     /// The smallest list of row groups, in bytes, for which templates are used. Below
     /// this the memory the templates need costs more to get than they can save.
-    // Note: a judgment, and not measured. The templates take three allocations, about a
-    // tenth of a microsecond, which is what parsing some hundreds of bytes costs. The
-    // smallest footer they help has not been looked for.
     const FOOTER_SIZE_MIN: usize = 4096;
 
     /// The fewest row groups that must still come for a template to be replaced when
     /// an integer has grown. Building a template costs a little more than parsing a
     /// chunk, and stepping over one length costs a small part of that, so replacing
     /// pays only over many chunks.
-    // Note: estimated from two measured costs, about 90 ns to build a template and a
-    // few ns a chunk to step over a length. Replacing made the fixtures of 100 and of
-    // 1000 row groups a third faster. Where exactly it starts to pay has not been
-    // measured.
     const DRIFT_ROW_GROUPS_LEFT_MIN: u32 = 32;
-
-    /// The mask may grow to the footer's remaining length divided by this, and so may
-    /// the list of binaries. One row group's worth of each is all the templates need
-    /// unless the columns keep changing, and a footer of this few row groups is the
-    /// only kind that has more.
-    const MASK_SIZE_DIVISOR: usize = 4;
 
     /// The list of columns may grow to the footer's remaining length divided by this.
     /// That is room for every column whose chunks take up twice what its entry in the
@@ -257,10 +252,7 @@ impl Templates {
     /// Templates for a list of `row_group_count` row groups that takes up at most
     /// `footer_size_left` bytes, if there is enough of it for them to pay.
     pub(super) fn for_row_groups(footer_size_left: usize, row_group_count: u32) -> Option<Self> {
-        if row_group_count < Self::ROW_GROUPS_MIN {
-            return None;
-        }
-        if footer_size_left < Self::FOOTER_SIZE_MIN {
+        if row_group_count < Self::ROW_GROUPS_MIN || footer_size_left < Self::FOOTER_SIZE_MIN {
             return None;
         }
         Some(Self::new(footer_size_left, row_group_count))
@@ -272,9 +264,10 @@ impl Templates {
         debug_assert!(row_group_count >= Self::ROW_GROUPS_MIN);
         Self {
             columns: Vec::new(),
+            alternates: Vec::new(),
             marks: Marks::new(),
             budget: Budget::new(footer_size_left),
-            mask_size_max: footer_size_left / Self::MASK_SIZE_DIVISOR,
+            mask_size_max: footer_size_left,
             column_count_max: footer_size_left / Self::COLUMNS_SIZE_DIVISOR / size_of::<Template>(),
             live_count: 0,
             row_groups_begun: 0,
@@ -346,8 +339,6 @@ impl Templates {
             // once and not as the columns are met.
             self.columns
                 .reserve_exact(chunk_positions.len().min(self.column_count_max));
-        } else {
-            // A later row group, which has the same columns.
         }
         let mut position = start;
         let mut located = 0;
@@ -360,10 +351,11 @@ impl Templates {
                 .get(column)
                 .is_some_and(|template| template.size > 0);
             if has_template {
-                // A run of chunks that match their templates, which is most chunks of
-                // most files.
+                // A run of chunks that match their templates (or their parked
+                // alternates), which is most chunks of most files.
                 let run = Run {
                     templates: self.columns.get_mut(column..).unwrap_or_default(),
+                    alternates: &self.alternates,
                     footer,
                     mask: self.marks.mask(),
                     chunk_positions: &mut chunk_positions[located..],
@@ -378,8 +370,6 @@ impl Templates {
                     continue;
                 }
                 // The first chunk of the run does not match its template as it is.
-            } else {
-                // No template to compare this chunk with.
             }
             chunk_positions[located] = footer_u32(position);
             position = self.chunk_end_slowly(footer_u32(column), footer, position)?;
@@ -403,37 +393,29 @@ impl Templates {
         let index = column as usize;
         if index >= self.columns.len() {
             if index >= self.column_count_max {
-                // More columns than there is room to keep templates for.
                 return skip_end(footer, start);
             }
             // Columns come in order in every row group, so a new one is always the next.
             debug_assert_eq!(index, self.columns.len());
             self.columns.push(Template::NONE);
-        } else {
-            // A column seen in an earlier row group.
         }
         let template = self.columns[index];
         if template.size > 0 {
-            // The chunk is still parsed by the same steps as its template if the two
-            // differ only in the lengths of integers and binaries.
-            if let Some(stepped) = stepped_end(&template, footer, &self.marks, start) {
-                debug_assert_eq!(skip_end(footer, start).ok(), Some(stepped.end));
-                self.columns[index].hits = template.hits.saturating_add(1);
-                self.budget.earn(i64::from(template.size));
-                #[cfg(test)]
-                {
-                    self.stepped_count += 1;
-                }
-                self.learn(index, footer, start, &stepped);
-                return Ok(stepped.end);
+            if let Some(end) = self.try_step(index, footer, start) {
+                return Ok(end);
             }
-            // The column's chunks have changed. Comparing later chunks with this
-            // template would cost a little each time and save nothing.
+            // The column's chunks have changed. Keep the old template in the alternate
+            // slot if a replacement is built, in case the column alternates between two
+            // shapes (for example, all-null and non-null row groups).
             self.columns[index].misses = template.misses.saturating_add(1);
+            if self.may_build(self.columns[index]) {
+                self.park_alternate(index);
+                return self.template_build(index, footer, start);
+            }
             self.columns[index].size = 0;
+            self.columns[index].alternate = 0;
             self.live_count = self.live_count.saturating_sub(1);
-        } else {
-            // Nothing to compare the chunk with.
+            return skip_end(footer, start);
         }
         if self.may_build(self.columns[index]) {
             self.template_build(index, footer, start)
@@ -442,16 +424,72 @@ impl Templates {
         }
     }
 
+    /// Tries stepping over differing lengths against column `index`'s primary template,
+    /// then against its parked alternate. If the alternate matches, swaps it into the
+    /// primary slot so `learn` updates it.
+    fn try_step(&mut self, index: usize, footer: &[u8], start: usize) -> Option<usize> {
+        let primary = self.columns[index];
+        let stepped = if let Some(stepped) = stepped_end(&primary, footer, &self.marks, start) {
+            stepped
+        } else {
+            let alt_slot = usize::from(primary.alternate.checked_sub(1)?);
+            let alternate = self.alternates[alt_slot];
+            let stepped = stepped_end(&alternate, footer, &self.marks, start)?;
+            self.alternates[alt_slot] = Template {
+                alternate: 0,
+                ..primary
+            };
+            self.columns[index] = Template {
+                hits: primary.hits,
+                misses: primary.misses,
+                alternate: primary.alternate,
+                ..alternate
+            };
+            stepped
+        };
+        debug_assert_eq!(skip_end(footer, start).ok(), Some(stepped.end));
+        self.columns[index].hits = self.columns[index].hits.saturating_add(1);
+        self.budget.earn(i64::from(self.columns[index].size));
+        #[cfg(test)]
+        {
+            self.stepped_count += 1;
+        }
+        self.learn(index, footer, start, &stepped);
+        Some(stepped.end)
+    }
+
+    /// Saves column `index`'s current template into its alternate slot, if within the
+    /// template memory bound.
+    fn park_alternate(&mut self, index: usize) {
+        let parked = Template {
+            alternate: 0,
+            ..self.columns[index]
+        };
+        if let Some(alt_slot) = self.columns[index].alternate.checked_sub(1) {
+            self.alternates[usize::from(alt_slot)] = parked;
+            return;
+        }
+        if self.columns.len() + self.alternates.len() < self.column_count_max
+            && let Ok(slot) = u16::try_from(self.alternates.len() + 1)
+        {
+            self.alternates.push(parked);
+            self.columns[index].alternate = slot;
+        }
+    }
+
     /// Takes in what a chunk that matched by stepping over lengths showed about its
     /// column: those lengths vary. The template remembers them, so that the next
     /// chunk is compared around them. If it has no room for more, the column's chunks
     /// have drifted away from it, and the chunk at `start` replaces it.
     fn learn(&mut self, index: usize, footer: &[u8], start: usize, stepped: &Stepped) {
-        // An integer that has grown stays grown, if it is a file offset, and most that
-        // grow are. A template with the new length is then compared without stepping
-        // over anything, which repays building it when enough row groups follow.
-        let has_drifted =
-            stepped.integer_grew && self.row_groups_left >= Self::DRIFT_ROW_GROUPS_LEFT_MIN;
+        // An integer that has grown stays grown if it is a file offset. When the
+        // template has no varying lengths yet, replacing it restores zero-variable
+        // comparison; when it already tracks varying lengths (such as string bounds or
+        // fluctuating counts), keeping those avoids discarding learned state on every
+        // fluctuation.
+        let has_drifted = stepped.integer_grew
+            && self.columns[index].variable_count == 0
+            && self.row_groups_left >= Self::DRIFT_ROW_GROUPS_LEFT_MIN;
         if !has_drifted && self.columns[index].variables_add(stepped.variables()) {
             return;
         }
@@ -462,18 +500,13 @@ impl Templates {
         } else if has_drifted {
             // No template may be built now. Remembering the lengths is the next best.
             self.columns[index].variables_add(stepped.variables());
-        } else {
-            // The template stays as it is, and chunks like this one stay slow.
         }
     }
 
     /// Whether the chunk about to be parsed should become its column's template.
     const fn may_build(&self, template: Template) -> bool {
         // A template in the last row group has nothing left to be compared with.
-        if self.row_groups_left == 0 {
-            return false;
-        }
-        if template.misses_too_often() {
+        if self.row_groups_left == 0 || template.misses_too_often() {
             return false;
         }
         if self.marks.mask().len() >= self.mask_size_max {
@@ -512,8 +545,6 @@ impl Templates {
         self.budget.pay(template.is_untried(), cost);
         if template.size == 0 {
             self.live_count += 1;
-        } else {
-            // The column had a template, which this one replaces.
         }
         template.position = footer_u32(start);
         template.size = footer_u32(size);
@@ -566,6 +597,8 @@ struct Run<'a> {
     /// The templates of those columns. Fewer than the chunks, if the later columns
     /// have no template yet.
     templates: &'a mut [Template],
+    /// Parked alternate templates for columns that alternate between two shapes.
+    alternates: &'a [Template],
     footer: &'a [u8],
     /// The whole mask, which the templates point into.
     mask: &'a [u8],
@@ -583,7 +616,7 @@ struct RunEnd {
 
 impl Run<'_> {
     /// Passes over chunks, from the one that starts at `start`, for as long as each
-    /// matches its column's template.
+    /// matches its column's template or parked alternate.
     // The loop that most of the pass's time goes to on a file of many row groups. It
     // is its own function, over slices and integers, so that its few values stay in
     // registers: inlined into the pass, they were kept on the stack
@@ -593,7 +626,21 @@ impl Run<'_> {
         let mut position = start;
         let mut chunk_count = 0;
         for (template, chunk_position) in self.templates.iter_mut().zip(self.chunk_positions) {
-            let Some(end) = matched_end(template, self.footer, self.mask, position) else {
+            let mut active: &Template = template;
+            let end = loop {
+                if let Some(end) = matched_end(active, self.footer, self.mask, position) {
+                    break Some(end);
+                }
+                let Some(alt_slot) = active.alternate.checked_sub(1) else {
+                    break None;
+                };
+                let Some(alternate) = self.alternates.get(usize::from(alt_slot)) else {
+                    break None;
+                };
+                debug_assert_eq!(alternate.alternate, 0);
+                active = alternate;
+            };
+            let Some(end) = end else {
                 break;
             };
             // Parsing takes the same steps over this chunk as over the template.
