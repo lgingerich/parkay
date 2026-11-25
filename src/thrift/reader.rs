@@ -245,6 +245,58 @@ impl<'a> CompactReader<'a> {
         Some(acc)
     }
 
+    /// Fast path for reading a short (`< 15` elements) `List<Struct>` whose elements each
+    /// hold exactly the `i32` fields 1, 2, and 3, in that order, the first two as
+    /// single-byte varints (`< 0x80`) and the third in at most two bytes. Folds each
+    /// element's three decoded values with `fold` and advances past the list only if
+    /// every element has that shape and `fold` returns `Some`; otherwise leaves `self`
+    /// untouched and returns `None`.
+    #[inline]
+    pub(crate) fn try_fold_short_i32_triple_list<T>(
+        &mut self,
+        init: T,
+        mut fold: impl FnMut(T, [i32; 3]) -> Option<T>,
+    ) -> Option<T> {
+        /// The header of an `i32` field whose id is one above the field before it.
+        const NEXT: u8 = 0x10 | wire_type::I32;
+        let rest = self.input.get(self.position..)?;
+        let (&header, mut elements) = rest.split_first()?;
+        if header & 0x0F != wire_type::STRUCT || header >= 0xF0 {
+            return None;
+        }
+        let mut acc = init;
+        for _ in 0..header >> 4 {
+            let (first, second, third, len) = match *elements {
+                [NEXT, first, NEXT, second, NEXT, low, wire_type::STOP, ..] if low < 0x80 => {
+                    (first, second, u32::from(low), 7)
+                }
+                [
+                    NEXT,
+                    first,
+                    NEXT,
+                    second,
+                    NEXT,
+                    low,
+                    high,
+                    wire_type::STOP,
+                    ..,
+                ] if low >= 0x80 && high < 0x80 => {
+                    let third = u32::from(low & 0x7F) | (u32::from(high) << 7);
+                    (first, second, third, 8)
+                }
+                _ => return None,
+            };
+            if first >= 0x80 || second >= 0x80 {
+                return None;
+            }
+            let values = [u32::from(first), u32::from(second), third].map(u32::zigzag_decode);
+            acc = fold(acc, values)?;
+            elements = &elements[len..];
+        }
+        self.position += rest.len() - elements.len();
+        Some(acc)
+    }
+
     /// Fast path for skipping a short (`< 15` elements) `List<Binary>` whose elements
     /// each have a single-byte length (`< 0x80`). Advances past the list on success;
     /// leaves `self` untouched and returns `false` on any other case.

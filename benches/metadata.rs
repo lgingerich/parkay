@@ -13,6 +13,11 @@
 //!   (first, middle, last) in every row group. A typical query's planning.
 //! - `open_all`: open, then extract the locations and statistics of every column. The
 //!   lazy design's worst case.
+//! - `open_locations`: open, then extract the location of every column and nothing
+//!   else. What a scan of every column needs before it reads any data.
+//! - `open_encodings`: `open_locations` with the data page encodings as well, which a
+//!   reader that wants dictionary codes asks for. The difference between the two is what
+//!   reaching `encoding_stats` costs.
 //! - `arrow_open`, `arrow_open_narrow`, `arrow_open_all`: arrow-rs's metadata decode
 //!   configured to do the least work that returns the same thing: no statistics, the
 //!   three columns' statistics, every column's statistics. Encoding and size statistics
@@ -167,6 +172,10 @@ impl Case<'_> {
             .with_statistics()
     }
 
+    fn locations(&self) -> Request<'_> {
+        Request::new(Columns::All, 0..self.row_group_count).with_location()
+    }
+
     fn all(&self) -> Request<'_> {
         Request::new(Columns::All, 0..self.row_group_count)
             .with_location()
@@ -229,6 +238,30 @@ fn bench_entry(c: &mut Criterion, fixture: &Fixture) {
             for file in &entry.files {
                 file.open(entry.schema_shared.as_ref())
                     .extract(&file.all(), &mut facts)
+                    .unwrap();
+                black_box(&facts);
+            }
+        });
+    });
+    group.bench_function("open_locations", |b| {
+        let entry = cases();
+        let mut facts = ChunkFacts::new();
+        b.iter(|| {
+            for file in &entry.files {
+                file.open(entry.schema_shared.as_ref())
+                    .extract(&file.locations(), &mut facts)
+                    .unwrap();
+                black_box(&facts);
+            }
+        });
+    });
+    group.bench_function("open_encodings", |b| {
+        let entry = cases();
+        let mut facts = ChunkFacts::new();
+        b.iter(|| {
+            for file in &entry.files {
+                file.open(entry.schema_shared.as_ref())
+                    .extract(&file.locations().with_data_page_encodings(), &mut facts)
                     .unwrap();
                 black_box(&facts);
             }

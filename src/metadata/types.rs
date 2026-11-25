@@ -309,12 +309,12 @@ impl Encoding {
 /// The set of bits an [`Encodings`] may hold: one for each encoding the format defines.
 pub(super) const ENCODINGS_ALL: u16 = 0b111_1111_1101;
 
-/// The set of encodings used in a column chunk.
+/// A set of encodings: those a column chunk uses, or those its data pages use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Encodings(pub(super) u16);
 
 impl Encodings {
-    /// Whether the chunk uses `encoding`.
+    /// Whether `encoding` is in the set.
     #[must_use]
     pub const fn contains(self, encoding: Encoding) -> bool {
         self.0 & (1 << encoding.code()) != 0
@@ -345,8 +345,10 @@ pub struct Location {
     pub(super) uncompressed_size: u64,
     pub(super) value_count: u64,
     pub(super) encodings: Encodings,
+    pub(super) data_page_encodings: Encodings,
     pub(super) codec: CompressionCodec,
     pub(super) has_dictionary_page_offset: bool,
+    pub(super) has_data_page_encodings: bool,
 }
 
 impl Location {
@@ -357,8 +359,10 @@ impl Location {
         uncompressed_size: 0,
         value_count: 0,
         encodings: Encodings(0),
+        data_page_encodings: Encodings(0),
         codec: CompressionCodec::Uncompressed,
         has_dictionary_page_offset: false,
+        has_data_page_encodings: false,
     };
 
     /// Where the chunk's bytes start in the file.
@@ -421,6 +425,24 @@ impl Location {
     #[must_use]
     pub const fn encodings(&self) -> Encodings {
         self.encodings
+    }
+
+    /// The encodings of the chunk's data pages alone, from the footer's
+    /// `encoding_stats`. A chunk whose data pages are all dictionary-encoded has only
+    /// [`Encoding::RleDictionary`] or [`Encoding::PlainDictionary`] here, which
+    /// [`encodings`](Self::encodings) cannot show: it also covers the dictionary page
+    /// and the levels.
+    ///
+    /// `None` if the request did not ask for them with
+    /// [`Request::with_data_page_encodings`](super::Request::with_data_page_encodings),
+    /// or if the footer does not record them, as footers of older writers do not.
+    #[must_use]
+    pub const fn data_page_encodings(&self) -> Option<Encodings> {
+        if self.has_data_page_encodings {
+            Some(self.data_page_encodings)
+        } else {
+            None
+        }
     }
 }
 

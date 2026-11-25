@@ -30,6 +30,7 @@ pub struct Request<'a> {
     row_group_end: u32,
     location: bool,
     statistics: bool,
+    data_page_encodings: bool,
 }
 
 impl<'a> Request<'a> {
@@ -44,6 +45,7 @@ impl<'a> Request<'a> {
             row_group_end: row_groups.end,
             location: false,
             statistics: false,
+            data_page_encodings: false,
         }
     }
 
@@ -52,6 +54,20 @@ impl<'a> Request<'a> {
     #[must_use]
     pub const fn with_location(mut self) -> Self {
         self.location = true;
+        self
+    }
+
+    /// Also extracts each chunk's [`Location`] with the encodings of its data pages
+    /// filled in ([`Location::data_page_encodings`]), which say whether a chunk is
+    /// dictionary-encoded throughout.
+    ///
+    /// This is a request of its own because the footer records these after a chunk's
+    /// statistics: reading them means passing over the statistics of every chunk, which
+    /// a request for locations alone never touches.
+    #[must_use]
+    pub const fn with_data_page_encodings(mut self) -> Self {
+        self.location = true;
+        self.data_page_encodings = true;
         self
     }
 
@@ -269,24 +285,42 @@ impl Metadata {
                 column_count
             }
         };
-        match (request.location, request.statistics) {
-            (true, true) => {
-                self.extract_mode::<true, true>(row_groups, request.columns, column_count, facts)
+        let columns = request.columns;
+        // `with_data_page_encodings` also asks for the location, so the encodings are
+        // never wanted without it.
+        debug_assert!(request.location || !request.data_page_encodings);
+        match (
+            request.location,
+            request.statistics,
+            request.data_page_encodings,
+        ) {
+            (true, true, true) => {
+                self.extract_mode::<true, true, true>(row_groups, columns, column_count, facts)
             }
-            (true, false) => {
-                self.extract_mode::<true, false>(row_groups, request.columns, column_count, facts)
+            (true, true, false) => {
+                self.extract_mode::<true, true, false>(row_groups, columns, column_count, facts)
             }
-            (false, true) => {
-                self.extract_mode::<false, true>(row_groups, request.columns, column_count, facts)
+            (true, false, true) => {
+                self.extract_mode::<true, false, true>(row_groups, columns, column_count, facts)
             }
-            (false, false) => {
-                self.extract_mode::<false, false>(row_groups, request.columns, column_count, facts)
+            (true, false, false) => {
+                self.extract_mode::<true, false, false>(row_groups, columns, column_count, facts)
+            }
+            (false, true, _) => {
+                self.extract_mode::<false, true, false>(row_groups, columns, column_count, facts)
+            }
+            (false, false, _) => {
+                self.extract_mode::<false, false, false>(row_groups, columns, column_count, facts)
             }
         }
     }
 
     /// Decodes the requested chunks, specialized by which fact groups are wanted.
-    fn extract_mode<const WANT_LOCATION: bool, const WANT_STATISTICS: bool>(
+    fn extract_mode<
+        const WANT_LOCATION: bool,
+        const WANT_STATISTICS: bool,
+        const WANT_DATA_PAGE_ENCODINGS: bool,
+    >(
         &self,
         row_groups: Range<u32>,
         columns: Columns<'_>,
@@ -303,14 +337,14 @@ impl Metadata {
         facts.prepare(chunk_count, WANT_LOCATION, WANT_STATISTICS);
         match columns {
             Columns::All => {
-                self.extract_all_mode::<WANT_LOCATION, WANT_STATISTICS>(
+                self.extract_all_mode::<WANT_LOCATION, WANT_STATISTICS, WANT_DATA_PAGE_ENCODINGS>(
                     row_groups.start,
                     chunk_count,
                     facts,
                 )?;
             }
             Columns::Indices(indices) => {
-                self.extract_indices_mode::<WANT_LOCATION, WANT_STATISTICS>(
+                self.extract_indices_mode::<WANT_LOCATION, WANT_STATISTICS, WANT_DATA_PAGE_ENCODINGS>(
                     row_groups,
                     indices,
                     chunk_count,
@@ -325,7 +359,11 @@ impl Metadata {
     /// Decodes a contiguous run of all-columns chunks without per-chunk closure calls or
     /// bounds checks on `facts`.
     #[inline(never)]
-    fn extract_all_mode<const WANT_LOCATION: bool, const WANT_STATISTICS: bool>(
+    fn extract_all_mode<
+        const WANT_LOCATION: bool,
+        const WANT_STATISTICS: bool,
+        const WANT_DATA_PAGE_ENCODINGS: bool,
+    >(
         &self,
         row_group_start: u32,
         chunk_count: usize,
@@ -362,7 +400,9 @@ impl Metadata {
                 file_size: self.file_size,
             };
             if let Err(source) =
-                column_chunk_decode::<WANT_LOCATION, WANT_STATISTICS>(chunk, location, stats)
+                column_chunk_decode::<WANT_LOCATION, WANT_STATISTICS, WANT_DATA_PAGE_ENCODINGS>(
+                    chunk, location, stats,
+                )
             {
                 return Err(chunk_error_all(
                     row_group_start,
@@ -377,7 +417,11 @@ impl Metadata {
 
     /// Decodes selected column indices across `row_groups`.
     #[inline(never)]
-    fn extract_indices_mode<const WANT_LOCATION: bool, const WANT_STATISTICS: bool>(
+    fn extract_indices_mode<
+        const WANT_LOCATION: bool,
+        const WANT_STATISTICS: bool,
+        const WANT_DATA_PAGE_ENCODINGS: bool,
+    >(
         &self,
         row_groups: Range<u32>,
         indices: &[u32],
@@ -419,7 +463,9 @@ impl Metadata {
                 };
                 index += 1;
                 if let Err(source) =
-                    column_chunk_decode::<WANT_LOCATION, WANT_STATISTICS>(chunk, location, stats)
+                    column_chunk_decode::<WANT_LOCATION, WANT_STATISTICS, WANT_DATA_PAGE_ENCODINGS>(
+                        chunk, location, stats,
+                    )
                 {
                     return Err(chunk_error(row_group, column, source));
                 }

@@ -488,6 +488,15 @@ fuzz_target!(|data: &[u8]| {
         .extract(&statistics_request, &mut statistics)
         .is_ok();
 
+    // The data page encodings read further into each chunk than its location does, so
+    // they are extracted on their own for the same reason.
+    let mut page_encodings = ChunkFacts::new();
+    let page_encodings_request =
+        Request::new(Columns::All, 0..metadata.row_group_count()).with_data_page_encodings();
+    let has_page_encodings = metadata
+        .extract(&page_encodings_request, &mut page_encodings)
+        .is_ok();
+
     for (row_group, theirs) in (0..).zip(arrow.row_groups()) {
         assert_eq!(
             metadata
@@ -542,6 +551,28 @@ fuzz_target!(|data: &[u8]| {
                         theirs.encodings_mask().is_set(their_encoding),
                         "row group {row_group}, column {column} encoding {our_encoding:?}"
                     );
+                }
+            }
+            if has_page_encodings {
+                // arrow-rs keeps the encoding statistics as the set of data page encodings.
+                let ours = page_encodings
+                    .location(slot)
+                    .expect("every chunk location was extracted")
+                    .data_page_encodings();
+                let theirs = theirs.page_encoding_stats_mask();
+                assert_eq!(
+                    ours.is_some(),
+                    theirs.is_some(),
+                    "row group {row_group}, column {column} has data page encodings"
+                );
+                if let (Some(ours), Some(theirs)) = (ours, theirs) {
+                    for (our_encoding, their_encoding) in ENCODINGS {
+                        assert_eq!(
+                            ours.contains(our_encoding),
+                            theirs.is_set(their_encoding),
+                            "row group {row_group}, column {column} data page encoding {our_encoding:?}"
+                        );
+                    }
                 }
             }
             if has_statistics {

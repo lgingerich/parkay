@@ -28,6 +28,8 @@ pub enum Structure {
     ColumnMetaData,
     /// The `Statistics` of a column chunk.
     Statistics,
+    /// One `PageEncodingStats` of a column chunk.
+    PageEncodingStats,
     /// One `ColumnOrder`.
     ColumnOrder,
     /// One `KeyValue` pair.
@@ -44,6 +46,7 @@ impl fmt::Display for Structure {
             Self::ColumnChunk => "ColumnChunk",
             Self::ColumnMetaData => "ColumnMetaData",
             Self::Statistics => "Statistics",
+            Self::PageEncodingStats => "PageEncodingStats",
             Self::ColumnOrder => "ColumnOrder",
             Self::KeyValue => "KeyValue",
         })

@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use bench_support::corpus;
-use parquet::basic::Type as ArrowType;
+use parquet::basic::{Encoding as ArrowEncoding, Type as ArrowType};
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::statistics::Statistics as ArrowStatistics;
 use proptest::prelude::*;
@@ -181,8 +181,8 @@ fn slot(row_group: u32, column: u32) -> ChunkSlot {
 
 fn everything(metadata: &Metadata) -> Request<'static> {
     Request::new(Columns::All, 0..metadata.row_group_count())
-        .with_location()
         .with_statistics()
+        .with_data_page_encodings()
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1403,198 @@ fn only_the_requested_facts_are_decoded() {
     ));
 }
 
+/// One `PageEncodingStats`: a page type, an encoding, and a count of pages.
+fn page_encoding_stats(page_type: i32, encoding: i32, count: i32) -> Value {
+    Value::Struct(vec![
+        (1, Value::I32(page_type)),
+        (2, Value::I32(encoding)),
+        (3, Value::I32(count)),
+    ])
+}
+
+/// A chunk's fields with the given `encoding_stats`.
+fn with_encoding_stats(entries: Vec<Value>) -> Vec<(i16, Value)> {
+    let mut fields = column_metadata(4, 100);
+    fields.push((13, structs(entries)));
+    fields
+}
+
+/// The data page encodings extracted from a file with one chunk, as whether the set
+/// holds `Plain`, `PlainDictionary`, and `RleDictionary`.
+fn data_page_encodings_of(metadata: &Metadata) -> Option<[bool; 3]> {
+    let mut facts = ChunkFacts::new();
+    let request = Request::new(Columns::All, 0..1).with_data_page_encodings();
+    metadata.extract(&request, &mut facts).unwrap();
+    let location = facts.location(slot(0, 0)).unwrap();
+    assert_eq!(location.start(), 4, "the location comes with the encodings");
+    let encodings = location.data_page_encodings()?;
+    Some(
+        [
+            Encoding::Plain,
+            Encoding::PlainDictionary,
+            Encoding::RleDictionary,
+        ]
+        .map(|encoding| encodings.contains(encoding)),
+    )
+}
+
+#[test]
+fn data_page_encodings_leave_out_other_pages() {
+    // A dictionary page in the older dictionary encoding, data pages of both versions,
+    // and an index page.
+    let mixed = one_chunk(with_encoding_stats(vec![
+        page_encoding_stats(2, 2, 1),
+        page_encoding_stats(0, 8, 3),
+        page_encoding_stats(3, 0, 1),
+        page_encoding_stats(1, 2, 1),
+    ]));
+    assert_eq!(data_page_encodings_of(&mixed), Some([true, false, true]));
+    // Only dictionary-encoded data pages.
+    let dictionary_only = one_chunk(with_encoding_stats(vec![
+        page_encoding_stats(2, 0, 1),
+        page_encoding_stats(0, 8, 7),
+    ]));
+    assert_eq!(
+        data_page_encodings_of(&dictionary_only),
+        Some([false, false, true])
+    );
+    // An entry counts even when it gives no pages, as in arrow-rs.
+    let no_pages = one_chunk(with_encoding_stats(vec![
+        page_encoding_stats(0, 8, 7),
+        page_encoding_stats(0, 0, 0),
+    ]));
+    assert_eq!(data_page_encodings_of(&no_pages), Some([true, false, true]));
+    // Page counts of every encoded length, the largest a count can be included.
+    for count in [63, 64, 8191, 8192, i32::MAX] {
+        let counted = one_chunk(with_encoding_stats(vec![
+            page_encoding_stats(2, 0, 1),
+            page_encoding_stats(3, 8, count),
+        ]));
+        assert_eq!(
+            data_page_encodings_of(&counted),
+            Some([false, false, true]),
+            "{count} pages"
+        );
+    }
+    // More entries than a short list holds.
+    let mut entries = vec![page_encoding_stats(0, 0, 1)];
+    entries.resize(20, page_encoding_stats(2, 2, 1));
+    let long = one_chunk(with_encoding_stats(entries));
+    assert_eq!(data_page_encodings_of(&long), Some([true, false, false]));
+}
+
+#[test]
+fn data_page_encodings_are_absent_unless_recorded_and_requested() {
+    // A footer that records none.
+    let unrecorded = one_chunk(column_metadata(4, 100));
+    assert_eq!(data_page_encodings_of(&unrecorded), None);
+    // An empty list is recorded: the chunk has no data pages.
+    let empty = one_chunk(with_encoding_stats(vec![]));
+    assert_eq!(data_page_encodings_of(&empty), Some([false, false, false]));
+    // Recorded, but not requested.
+    let metadata = one_chunk(with_encoding_stats(vec![page_encoding_stats(0, 8, 1)]));
+    let mut facts = ChunkFacts::new();
+    let request = Request::new(Columns::All, 0..1)
+        .with_location()
+        .with_statistics();
+    let mut extracted = |asked: &Request<'_>| {
+        metadata.extract(asked, &mut facts).unwrap();
+        facts.location(slot(0, 0)).unwrap().data_page_encodings()
+    };
+    assert_eq!(extracted(&request), None);
+    // Storage that held encodings does not keep them for the next request.
+    assert!(extracted(&everything(&metadata)).is_some());
+    assert_eq!(extracted(&request), None);
+}
+
+#[test]
+fn malformed_encoding_stats_fail_only_the_requests_that_read_them() {
+    let invalid = |entry: Value, field: u8| {
+        let metadata = one_chunk(with_encoding_stats(vec![
+            page_encoding_stats(0, 8, 1),
+            entry,
+        ]));
+        // Locations and statistics do not read the list.
+        let request = Request::new(Columns::All, 0..1)
+            .with_location()
+            .with_statistics();
+        metadata.extract(&request, &mut ChunkFacts::new()).unwrap();
+        assert!(matches!(
+            chunk_error(&metadata, &everything(&metadata)),
+            FooterError::InvalidValue { structure: Structure::PageEncodingStats, field: found, .. }
+                if found == field
+        ));
+    };
+    // A page type and an encoding the format does not have, and a negative count.
+    invalid(page_encoding_stats(4, 0, 1), 1);
+    invalid(page_encoding_stats(-1, 0, 1), 1);
+    invalid(page_encoding_stats(0, 1, 1), 2);
+    invalid(page_encoding_stats(0, 11, 1), 2);
+    invalid(page_encoding_stats(0, -1, 1), 2);
+    invalid(page_encoding_stats(0, 0, -1), 3);
+    // The same holds for an entry that does not describe data pages.
+    invalid(page_encoding_stats(2, 1, 1), 2);
+
+    for field in [1_u8, 2, 3] {
+        let Value::Struct(mut entry) = page_encoding_stats(0, 8, 1) else {
+            unreachable!("an entry is a structure");
+        };
+        entry.retain(|(id, _)| *id != i16::from(field));
+        let metadata = one_chunk(with_encoding_stats(vec![Value::Struct(entry)]));
+        assert_eq!(
+            chunk_error(&metadata, &everything(&metadata)),
+            FooterError::MissingField {
+                structure: Structure::PageEncodingStats,
+                field
+            }
+        );
+    }
+
+    let repeated = Value::Struct(vec![
+        (1, Value::I32(0)),
+        (2, Value::I32(8)),
+        (3, Value::I32(1)),
+        (2, Value::I32(0)),
+    ]);
+    let metadata = one_chunk(with_encoding_stats(vec![repeated]));
+    assert!(matches!(
+        chunk_error(&metadata, &everything(&metadata)),
+        FooterError::DuplicateField {
+            structure: Structure::PageEncodingStats,
+            field: 2,
+            ..
+        }
+    ));
+
+    // A list of something other than structures.
+    let mut fields = column_metadata(4, 100);
+    fields.push((13, Value::List(ElementType::I32, vec![Value::I32(0)])));
+    let mistyped = one_chunk(fields);
+    assert!(matches!(
+        chunk_error(&mistyped, &everything(&mistyped)),
+        FooterError::InvalidValue {
+            structure: Structure::ColumnMetaData,
+            field: 13,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unknown_and_reordered_fields_of_encoding_stats_are_handled() {
+    let entry = Value::Struct(vec![
+        (3, Value::I32(1)),
+        (2, Value::I32(8)),
+        (1, Value::I32(3)),
+        (9, text("a field of a later format")),
+    ]);
+    let metadata = one_chunk(with_encoding_stats(vec![entry]));
+    assert_eq!(
+        data_page_encodings_of(&metadata),
+        Some([false, false, true])
+    );
+}
+
 #[test]
 fn each_required_location_field_is_required() {
     for field in [2, 4, 5, 6, 7, 9] {
@@ -1663,6 +1855,34 @@ fn assert_location_matches(context: &str, ours: &Location, theirs: &ColumnChunkM
         format!("{:?}", theirs.compression_codec()).replace('_', ""),
         "{context}: codec"
     );
+    // arrow-rs keeps the encoding statistics as the set of data page encodings.
+    let ours = ours.data_page_encodings().map(|encodings| {
+        [
+            Encoding::Plain,
+            Encoding::PlainDictionary,
+            Encoding::Rle,
+            Encoding::DeltaBinaryPacked,
+            Encoding::DeltaLengthByteArray,
+            Encoding::DeltaByteArray,
+            Encoding::RleDictionary,
+            Encoding::ByteStreamSplit,
+        ]
+        .map(|encoding| encodings.contains(encoding))
+    });
+    let theirs = theirs.page_encoding_stats_mask().map(|mask| {
+        [
+            ArrowEncoding::PLAIN,
+            ArrowEncoding::PLAIN_DICTIONARY,
+            ArrowEncoding::RLE,
+            ArrowEncoding::DELTA_BINARY_PACKED,
+            ArrowEncoding::DELTA_LENGTH_BYTE_ARRAY,
+            ArrowEncoding::DELTA_BYTE_ARRAY,
+            ArrowEncoding::RLE_DICTIONARY,
+            ArrowEncoding::BYTE_STREAM_SPLIT,
+        ]
+        .map(|encoding| mask.is_set(encoding))
+    });
+    assert_eq!(ours, theirs, "{context}: data page encodings");
 }
 
 fn assert_statistics_match(
