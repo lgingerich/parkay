@@ -91,6 +91,12 @@ impl Marks {
         self.binaries.as_slice().split_at(self.binaries_size).0
     }
 
+    /// Current backing length of the mask buffer, including zeroed slack.
+    #[cfg(test)]
+    pub(super) const fn mask_backing_len(&self) -> usize {
+        self.mask.len()
+    }
+
     /// Snapshots the current lengths before a `skip_marking` call so failures can roll back.
     pub(super) const fn snapshot(&self) -> (usize, usize) {
         (self.mask_size, self.binaries_size)

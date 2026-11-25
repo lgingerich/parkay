@@ -21,6 +21,11 @@ use super::varint::read_size_fast_cold;
 /// Clamped to `input_len + 8` by [`Marking::grow_to`].
 const MASK_GROW_LOOKAHEAD: usize = 64;
 
+/// Maximum encoded length in bytes of a valid `u32` size varint (`ceil(32 / 7) == 5`).
+/// When at least this many bytes are available in the window and `read_size_fast_cold`
+/// returns `None`, the varint itself is malformed rather than truncated at the window edge.
+const SIZE_VARINT_LEN_MAX: usize = 5;
+
 /// Inline nesting depth handled iteratively inside [`skip_struct_fast`] without recursion
 /// or window re-entry. Four entries cover 5 levels of nested structs
 /// (`FileMetaData` -> `RowGroup` -> `ColumnChunk` -> `ColumnMetaData` -> `Statistics`).
@@ -29,6 +34,7 @@ const INLINE_STACK: usize = 4;
 // `StructState::pop_frame` masks `*top` with `INLINE_STACK - 1` and depth with `0xFF`.
 const _: () = assert!(INLINE_STACK.is_power_of_two());
 const _: () = assert!(SKIP_DEPTH_MAX <= u8::MAX as u16);
+const _: () = assert!(u32::BITS.div_ceil(7) as usize == SIZE_VARINT_LEN_MAX);
 
 impl CompactReader<'_> {
     /// Skips the value of a struct field. A bool field's value is in its header, so
@@ -203,30 +209,18 @@ fn skip_varint_fast<const WITH_HEADER: bool, W: MaskWindow>(
     mask: &mut W,
 ) -> Option<usize> {
     let pos = if WITH_HEADER { start + 1 } else { start };
-    let Some(&first) = in_win.get(pos) else {
-        return skip_fail();
-    };
-    if first < 0x80 {
-        if WITH_HEADER {
-            mask.write_pair::<{ Marks::STRUCTURE }, { Marks::VARINT }>(start);
+    // One 8-byte load finds the end of every varint up to 8 bytes long without branching
+    // on its length, which mixes one-byte and multi-byte values from field to field.
+    let end = if let Some(chunk) = in_win.get(pos..).and_then(|r| r.first_chunk::<8>()) {
+        let terminators = !u64::from_le_bytes(*chunk) & 0x8080_8080_8080_8080;
+        if terminators != 0 {
+            pos + (terminators.trailing_zeros() >> 3) as usize + 1
         } else {
-            mask.write_byte::<{ Marks::VARINT }>(start);
+            skip_varint_long_fast(in_win, pos + 8)?
         }
-        return Some(pos + 1);
-    }
-    if let Some(chunk) = in_win.get(pos + 1..).and_then(|r| r.first_chunk::<4>()) {
-        let term = !u32::from_le_bytes(*chunk) & 0x8080_8080;
-        let tz = term.trailing_zeros();
-        if tz < 32 {
-            let idx = (tz >> 3) as usize;
-            mask.write_swar::<WITH_HEADER>(start, idx);
-            return Some(pos + 2 + idx);
-        }
-        let end = skip_varint_long_fast(in_win, pos + 5)?;
-        mask.write_run::<WITH_HEADER, { Marks::VARINT }>(start, end);
-        return Some(end);
-    }
-    let end = skip_varint_long_fast(in_win, pos + 1)?;
+    } else {
+        skip_varint_long_fast(in_win, pos)?
+    };
     mask.write_run::<WITH_HEADER, { Marks::VARINT }>(start, end);
     Some(end)
 }
@@ -267,7 +261,11 @@ fn skip_binary_window<const WITH_HEADER: bool, W: MaskWindow, B: BinariesWindow>
         (u32::from(first), pos + 1)
     } else {
         let Some((size, next)) = read_size_fast_cold(in_win, pos) else {
-            return ElemStep::NeedGrow(Grow::Mask);
+            return if in_win.len() - pos >= SIZE_VARINT_LEN_MAX {
+                ElemStep::Fail
+            } else {
+                ElemStep::NeedGrow(Grow::Mask)
+            };
         };
         let next = next.get();
         if !bins.try_record(pos) {
@@ -395,8 +393,13 @@ fn skip_list_window<const FIELD_HEADER: bool, M: Marker>(
         mark_list_short_header::<FIELD_HEADER, _>(mask, pos);
         (u32::from(short_size), pos + 1)
     } else {
-        let Some((size, next)) = read_size_fast_cold(in_win, pos + 1) else {
-            return ListOutcome::HeaderNeedGrow;
+        let size_pos = pos + 1;
+        let Some((size, next)) = read_size_fast_cold(in_win, size_pos) else {
+            return if in_win.len() - size_pos >= SIZE_VARINT_LEN_MAX {
+                ListOutcome::Fail
+            } else {
+                ListOutcome::HeaderNeedGrow
+            };
         };
         let next = next.get();
         let header_start = if FIELD_HEADER { pos - 1 } else { pos };
@@ -1013,6 +1016,94 @@ fn skip_struct_fast<const ITERATIVE: bool, M: Marker>(
             WindowExit::Complex(ComplexExit::Map(at)) => {
                 pos = skip_map_fast_cold(input, at, state.depth + 1, marker)?;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thrift::VarintTarget;
+
+    #[test]
+    fn skip_marking_does_not_grow_mask_on_malformed_sizes() {
+        let large_tail = 1 << 20;
+        // 1. Binary field with overflowing u32 varint size.
+        let mut binary_overflow = vec![0x18, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        binary_overflow.resize(large_tail, 0);
+        // 2. Binary field with size > i32::MAX (0x8000_0000).
+        let mut binary_size_max = vec![0x18, 0x80, 0x80, 0x80, 0x80, 0x08];
+        binary_size_max.resize(large_tail, 0);
+        // 3. Struct field holding a long-size list whose size varint overflows u32.
+        let mut list_field_overflow = vec![0x19, 0xF5, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        list_field_overflow.resize(large_tail, 0);
+        // 4. Top-level long-size list whose size > i32::MAX.
+        let mut top_list_size_max = vec![0xF5, 0x80, 0x80, 0x80, 0x80, 0x08];
+        top_list_size_max.resize(large_tail, 0);
+        // 5. Binary element inside a list with overflowing size varint.
+        let mut list_binary_overflow = vec![0x19, 0x18, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        list_binary_overflow.resize(large_tail, 0);
+
+        let cases = [
+            (
+                ElementType::Struct,
+                &binary_overflow,
+                ThriftError::VarintOverflow {
+                    offset: 1,
+                    target: VarintTarget::U32,
+                },
+            ),
+            (
+                ElementType::Struct,
+                &binary_size_max,
+                ThriftError::SizeOverflow {
+                    offset: 1,
+                    size: 0x8000_0000,
+                },
+            ),
+            (
+                ElementType::Struct,
+                &list_field_overflow,
+                ThriftError::VarintOverflow {
+                    offset: 2,
+                    target: VarintTarget::U32,
+                },
+            ),
+            (
+                ElementType::List,
+                &top_list_size_max,
+                ThriftError::SizeOverflow {
+                    offset: 0,
+                    size: 0x8000_0000,
+                },
+            ),
+            (
+                ElementType::Struct,
+                &list_binary_overflow,
+                ThriftError::VarintOverflow {
+                    offset: 2,
+                    target: VarintTarget::U32,
+                },
+            ),
+        ];
+
+        for (element_type, input, expected) in cases {
+            let mut plain = CompactReader::new(input, 0);
+            assert_eq!(plain.skip(element_type), Err(expected));
+
+            let mut marks = Marks::new();
+            let mut marking = CompactReader::new(input, 0);
+            assert_eq!(
+                marking.skip_marking(element_type, &mut marks),
+                Err(expected)
+            );
+            assert_eq!(marks.mask(), []);
+            // Initial window is ~4 KiB; malformed size must fail without growing toward 1 MiB.
+            assert!(
+                marks.mask_backing_len() <= 8192,
+                "mask grew to {} bytes on malformed size",
+                marks.mask_backing_len()
+            );
         }
     }
 }

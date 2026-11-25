@@ -6,7 +6,7 @@ Architectural rationale and contracts for Parkay's metadata layer. For module bo
 
 Opening a file makes one pass over the footer to decode file-level metadata and record the byte offset where each row group and column chunk starts—the **footer directory** (not called an "index" to avoid colliding with Parquet's page/column/offset indexes). Column-chunk details are decoded on demand via `Metadata::extract()`.
 
-- **Reuse across scans and files:** Callers scanning one file repeatedly reuse the immutable `Metadata` directly. Across files of one dataset, `open()` accepts `Option<&Schema>` and skips schema decoding when the footer's leading schema bytes match identically (guaranteeing identical decode and end offset).
+- **Reuse across scans and files:** Callers scanning one file repeatedly reuse the immutable `Metadata` directly. Across files of one dataset, `open()` accepts `Option<&Schema>` and skips schema decoding when the footer's leading schema bytes match identically (guaranteeing identical decode and end offset) and the schema fits the call's `Limits::schema_depth_max`.
 - **Saves CPU and memory, not round trips:** On object storage, dependent request count dominates (2 requests best case when the tail covers footer + page index; up to 4 worst case, plus 1 for a Bloom filter lacking `bloom_filter_length`). On local storage and cached metadata, parse time and retained footprint dominate.
 - **Two structural bounds:** Thrift compact protocol has no length prefixes on structs, so `open()` must walk every footer byte to reach fields after `row_groups`. Chunk templates bring multi-row-group opens close to memory-scan speed; single-row-group footers remain bounded by Thrift `skip`. Conversely, reading every column of every row group touches the footer twice (open pass + extraction pass) instead of an eager parser's single pass.
 
@@ -40,7 +40,7 @@ Shape invariants: no self-references (offsets/lengths into the retained footer; 
 
 Across row groups, a column's chunks usually share identical Thrift structure with different values. Templates skip matching chunks without re-parsing them while guaranteeing exact equivalence with full parsing (soundness argument in `src/metadata/template/compare.rs`):
 
-- **Masked comparison:** `CompactReader::skip_marking` records every bit that parsing inspects (headers, sizes, varint continuation bits—never binary payloads). A later chunk matching its column's template under that mask follows identical parse steps and ends at the same offset. Up to four varying integer/binary lengths are learned and stepped over without falling back.
+- **Masked comparison:** `CompactReader::skip_marking` records every bit that parsing inspects (headers, sizes, varint continuation bits—never binary payloads). A later chunk matching its column's template under that mask follows identical parse steps and ends at the same offset. Up to eight varying integer/binary lengths are learned and stepped over without falling back, and a parked alternate slot preserves a column's previous template so columns alternating between two shapes (e.g., all-null vs. non-null row groups) match without reparsing.
 - **Bounded worst-case cost and memory:** A credit budget grants one initial template per column and funds replacements only from prior match savings, so non-matching footers degrade by ~0%. Templates are transient working memory bounded to roughly the footer's size and are cross-checked against full parsing in debug, test, and fuzz builds.
 
 ## Extraction and wire decoders

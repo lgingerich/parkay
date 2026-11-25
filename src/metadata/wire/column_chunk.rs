@@ -23,11 +23,13 @@ pub(in crate::metadata) struct Chunk<'a> {
     pub(in crate::metadata) file_size: u64,
 }
 
-/// Decodes the requested fields of one `ColumnChunk`.
+/// Decodes the requested fields of one `ColumnChunk`, writing directly into `location`
+/// and `statistics`.
 ///
 /// Specialized on `WANT_LOCATION` and `WANT_STATISTICS` so unrequested groups compile
 /// out and only the fields asked for are decoded. Decoding stops as soon as every wanted
 /// field is in hand, so what follows in the chunk is not read and not checked.
+#[inline(always)]
 pub(in crate::metadata) fn column_chunk_decode<
     const WANT_LOCATION: bool,
     const WANT_STATISTICS: bool,
@@ -37,8 +39,12 @@ pub(in crate::metadata) fn column_chunk_decode<
     statistics: &mut Statistics,
 ) -> Result<(), FooterError> {
     const STRUCTURE: Structure = Structure::ColumnChunk;
-    let mut loc = Location::EMPTY;
-    let mut stats = Statistics::EMPTY;
+    if WANT_LOCATION {
+        *location = Location::EMPTY;
+    }
+    if WANT_STATISTICS {
+        *statistics = Statistics::EMPTY;
+    }
     let mut reader = CompactReader::new(chunk.footer, chunk.position as usize);
     let mut seen = Seen::new();
     let mut cursor = FieldCursor::default();
@@ -51,8 +57,8 @@ pub(in crate::metadata) fn column_chunk_decode<
                 seen.mark(STRUCTURE, 3, &reader)?;
                 if column_metadata_decode::<WANT_LOCATION, WANT_STATISTICS>(
                     &mut reader,
-                    &mut loc,
-                    &mut stats,
+                    location,
+                    statistics,
                 )? {
                     break;
                 }
@@ -66,11 +72,7 @@ pub(in crate::metadata) fn column_chunk_decode<
     }
     seen.require(STRUCTURE, 3)?;
     if WANT_LOCATION {
-        location_check(&loc, chunk)?;
-        *location = loc;
-    }
-    if WANT_STATISTICS {
-        *statistics = stats;
+        location_check(location, chunk)?;
     }
     Ok(())
 }
@@ -79,6 +81,7 @@ pub(in crate::metadata) fn column_chunk_decode<
 ///
 /// Returns whether every wanted field was found before the end of the structure, in
 /// which case the reader is left part of the way through it.
+#[inline(always)]
 fn column_metadata_decode<const WANT_LOCATION: bool, const WANT_STATISTICS: bool>(
     reader: &mut CompactReader<'_>,
     location: &mut Location,
@@ -151,7 +154,17 @@ fn column_metadata_decode<const WANT_LOCATION: bool, const WANT_STATISTICS: bool
     Ok(false)
 }
 
+#[inline]
 fn skip_binary_list(reader: &mut CompactReader<'_>) -> Result<(), FooterError> {
+    if reader.try_skip_short_binary_list() {
+        return Ok(());
+    }
+    skip_binary_list_slow(reader)
+}
+
+#[cold]
+#[inline(never)]
+fn skip_binary_list_slow(reader: &mut CompactReader<'_>) -> Result<(), FooterError> {
     let header = reader.read_list_header()?;
     if header.element_type() == ElementType::Binary {
         for _ in 0..header.size() {
@@ -181,7 +194,22 @@ const fn unsupported(feature: Unsupported, offset: u32) -> FooterError {
 }
 
 /// Decodes a list of `Encoding` into a set.
+#[inline]
 fn encodings_decode(reader: &mut CompactReader<'_>) -> Result<Encodings, FooterError> {
+    if let Some(encodings) = reader.try_fold_short_i32_list(0_u16, |acc, code| {
+        let bit = 1_u16.checked_shl(code.cast_unsigned()).unwrap_or(0);
+        (bit & ENCODINGS_ALL != 0).then_some(acc | bit)
+    }) {
+        return Ok(Encodings(encodings));
+    }
+    encodings_decode_slow(reader)
+}
+
+/// Slow path for [`encodings_decode`] handling long lists, empty `0x00` lists,
+/// padded multi-byte encoding varints, and error reporting.
+#[cold]
+#[inline(never)]
+fn encodings_decode_slow(reader: &mut CompactReader<'_>) -> Result<Encodings, FooterError> {
     let mut local = reader.clone();
     let list_offset = offset(&local);
     let header = local.read_list_header()?;

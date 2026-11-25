@@ -47,6 +47,10 @@ pub struct Schema {
     pub(super) footer_prefix: Vec<u8>,
     /// The format version stated in those leading bytes.
     pub(super) version: i32,
+    /// Deepest nesting level present in `nodes` (0 for root-only, 1 for top-level
+    /// columns). Checked against [`Limits::schema_depth_max`](crate::Limits) when this
+    /// schema is reused across files.
+    pub(super) depth_max: u8,
 }
 
 impl Schema {
@@ -105,6 +109,11 @@ impl Schema {
         } else {
             Some((&self.footer_prefix, self.version))
         }
+    }
+
+    /// Deepest nesting level in this schema.
+    pub(super) const fn depth_max(&self) -> u8 {
+        self.depth_max
     }
 
     fn data(&self, index: u32) -> &NodeData {

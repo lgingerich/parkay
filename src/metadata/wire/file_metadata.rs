@@ -128,6 +128,12 @@ impl<'a> Pass<'a> {
         let Some(schema) = schema_shared else {
             return FieldCursor::default();
         };
+        // If the caller passed a tighter depth limit than the one `schema_shared` was
+        // opened under, fall through to `schema_decode` so `SchemaTooDeep` is reported
+        // at the exact offending element.
+        if schema.depth_max() > self.limits.schema_depth_max() {
+            return FieldCursor::default();
+        }
         let Some((footer_prefix, version)) = schema.footer_prefix() else {
             return FieldCursor::default();
         };
@@ -222,21 +228,21 @@ impl<'a> Pass<'a> {
         }
         let input_left = self.footer.len() - self.reader.position();
         self.templates = Templates::for_row_groups(input_left, header.size());
-        // A row group is at least seven bytes of footer, so this reserves at most a
-        // little over two bytes for each byte of input left.
-        // Note: both reservations here are exact, not rounded up. The lists are kept as
-        // they are in the metadata, and spare room would have to be given back with a
-        // second call to the allocator. A fifth of the time to open a small file went
-        // to the allocator before this (`docs/perf/open.md`).
-        let row_groups_max = input_left / RowGroup::ENCODED_SIZE_MIN;
+        // Each row group takes at least `ENCODED_SIZE_MIN` bytes plus 1 byte per column
+        // chunk. Upfront reservations are exact for real files (where every row group
+        // exceeds 16 bytes and every chunk exceeds 4 bytes), avoiding a shrink on
+        // `into_boxed_slice`, while capped at `input_left` bytes so a bogus header
+        // cannot amplify memory before row group 0 is decoded (`docs/perf/open.md`).
+        let row_group_min =
+            RowGroup::ENCODED_SIZE_MIN.saturating_add(self.chunk_count.unwrap_or(0) as usize);
+        let row_groups_max = input_left / row_group_min;
         let row_group_count = (header.size() as usize).min(row_groups_max);
-        self.row_groups.reserve_exact(row_group_count);
+        self.row_groups
+            .reserve_exact(row_group_count.min(input_left / size_of::<RowGroup>()));
         if let Some(chunk_count) = self.chunk_count {
-            // A chunk is at least a byte of footer, so this reserves at most four
-            // bytes for each byte of input left.
             let chunk_count_max = row_group_count.saturating_mul(chunk_count as usize);
             self.chunk_positions
-                .reserve_exact(chunk_count_max.min(input_left));
+                .reserve_exact(chunk_count_max.min(input_left / size_of::<u32>()));
         }
         for index in 0..header.size() {
             self.row_group_decode(index)?;
@@ -371,4 +377,65 @@ pub(in crate::metadata) fn column_order_decode(
         return Err(invalid_value(Structure::ColumnOrder, 1, union_offset));
     }
     Ok(column_order)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thrift::test_support::{Value, encoded};
+
+    #[test]
+    fn shared_schema_does_not_bypass_tighter_depth_limit() {
+        let elements = vec![
+            Value::Struct(vec![
+                (4, Value::Binary(b"root".to_vec())),
+                (5, Value::I32(1)),
+            ]),
+            Value::Struct(vec![
+                (3, Value::I32(1)),
+                (4, Value::Binary(b"g1".to_vec())),
+                (5, Value::I32(1)),
+            ]),
+            Value::Struct(vec![
+                (3, Value::I32(1)),
+                (4, Value::Binary(b"g2".to_vec())),
+                (5, Value::I32(1)),
+            ]),
+            Value::Struct(vec![
+                (1, Value::I32(1)),
+                (3, Value::I32(1)),
+                (4, Value::Binary(b"leaf".to_vec())),
+            ]),
+        ];
+        let footer = encoded(&Value::Struct(vec![
+            (1, Value::I32(1)),
+            (2, Value::List(ElementType::Struct, elements)),
+            (3, Value::I64(0)),
+            (4, Value::List(ElementType::Struct, vec![])),
+        ]));
+
+        let loose = Limits::new().with_schema_depth_max(8);
+        let decoded = decode(&footer, loose, None).unwrap();
+        let shared = decoded.schema.expect("first open decodes schema");
+        assert_eq!(shared.depth_max(), 3);
+
+        // Reusing with a sufficient limit skips decoding.
+        let reused = decode(
+            &footer,
+            Limits::new().with_schema_depth_max(3),
+            Some(&shared),
+        )
+        .unwrap();
+        assert!(reused.schema.is_none());
+
+        // Reusing with a tighter limit still rejects the schema at the offending element.
+        let tight = Limits::new().with_schema_depth_max(2);
+        assert_eq!(
+            decode(&footer, tight, Some(&shared)).unwrap_err(),
+            FooterError::SchemaTooDeep {
+                element: 3,
+                limit: 2,
+            }
+        );
+    }
 }

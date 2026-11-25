@@ -289,6 +289,7 @@ struct Builder {
     leaves: Vec<u32>,
     open: Vec<OpenGroup>,
     depth_max: u8,
+    depth_reached: u8,
 }
 
 impl Builder {
@@ -304,16 +305,25 @@ impl Builder {
     // without the string growing.
     const NAME_SIZE_RESERVED: usize = 14;
 
+    /// Ceiling on upfront element reservations before any `SchemaElement` is decoded.
+    /// Keeps upfront allocation under ~1 MiB even on a 1 GiB footer with a bogus schema
+    /// list header (avoiding ~20x amplification from `element_count * size_of::<NodeData>()`),
+    /// while remaining reallocation-free for schemas up to 16,384 nodes (including wide
+    /// 10,000-column tables).
+    const INITIAL_CAPACITY_MAX: usize = 16_384;
+
     /// A builder for a schema whose list says it has `element_count` elements, with
     /// `input_left` bytes of footer still unread.
     fn new(depth_max: u8, element_count: u32, input_left: usize) -> Self {
-        // Note: room for every element is made once, here, because growing step by
-        // step is a call to the allocator at each step. It is bounded by the input,
-        // not by a fixed number: at most what the largest schema that could follow
-        // would use.
-        let reserved = (element_count as usize).min(input_left / Self::ELEMENT_ENCODED_SIZE_MIN);
+        let reserved = (element_count as usize)
+            .min(input_left / Self::ELEMENT_ENCODED_SIZE_MIN)
+            .min(Self::INITIAL_CAPACITY_MAX);
+        // Raw name bytes cannot exceed the unread footer bytes.
+        let names_reserved = reserved
+            .saturating_mul(Self::NAME_SIZE_RESERVED)
+            .min(input_left);
         Self {
-            names: String::with_capacity(reserved * Self::NAME_SIZE_RESERVED),
+            names: String::with_capacity(names_reserved),
             nodes: Vec::with_capacity(reserved),
             // Note: one entry too many for each group, since only leaves go here.
             // Giving that back would cost a call to the allocator for a few bytes.
@@ -322,6 +332,7 @@ impl Builder {
             // built. An array on the stack would have to hold the limit's 255 levels.
             open: Vec::new(),
             depth_max,
+            depth_reached: 0,
         }
     }
 
@@ -333,6 +344,13 @@ impl Builder {
                 element: index,
                 limit: self.depth_max,
             });
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "depth <= self.depth_max which is a u8"
+        )]
+        {
+            self.depth_reached = self.depth_reached.max(depth as u8);
         }
         let parent = if let Some(parent) = self.open.last_mut() {
             debug_assert!(parent.children_left > 0);
@@ -391,6 +409,7 @@ impl Builder {
             leaves: self.leaves,
             footer_prefix: Vec::new(),
             version: 0,
+            depth_max: self.depth_reached,
         })
     }
 }
@@ -457,4 +476,26 @@ fn node_place(
         definition_level: parent.definition_level + defined,
         repetition_level: parent.repetition_level + repeated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_caps_upfront_reservation_on_adversarial_counts() {
+        let input_left = 100 * 1024 * 1024;
+        let builder = Builder::new(128, 30_000_000, input_left);
+        assert_eq!(builder.nodes.capacity(), Builder::INITIAL_CAPACITY_MAX);
+        assert_eq!(builder.leaves.capacity(), Builder::INITIAL_CAPACITY_MAX);
+        assert_eq!(
+            builder.names.capacity(),
+            Builder::INITIAL_CAPACITY_MAX * Builder::NAME_SIZE_RESERVED
+        );
+
+        // Even for a small buffer, names reservation never exceeds `input_left`.
+        let small = Builder::new(128, 100, 90);
+        assert_eq!(small.nodes.capacity(), 30);
+        assert!(small.names.capacity() <= 90);
+    }
 }

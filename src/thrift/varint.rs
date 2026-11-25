@@ -133,11 +133,12 @@ pub(super) fn read_size_fast_cold(input: &[u8], pos: usize) -> Option<(u32, NonZ
     Some((size, NonZeroUsize::new(reader.position)?))
 }
 
-/// Decodes a zigzag `i64` varint from `input[start..]`, returning `(value, byte_len)` in
-/// registers, or `(0, 0)` on EOF or overflow.
+/// Decodes a multi-byte zigzag `i64` varint from `input[start..]`, returning
+/// `(value, byte_len)` in registers, or `(0, 0)` on EOF or overflow.
 ///
 /// Out of line so multi-field decoders stay compact, and takes `input` + `start` by value
 /// so callers keep their reader in registers without a 16-byte stack return slot.
+/// Callers handle single-byte varints (`byte < 0x80`) inline before calling here.
 #[inline(never)]
 pub(super) fn decode_i64(input: &[u8], start: usize) -> (i64, u8) {
     let Some(rest) = input.get(start..) else {
@@ -145,8 +146,9 @@ pub(super) fn decode_i64(input: &[u8], start: usize) -> (i64, u8) {
     };
     if let Some(&bytes) = rest.first_chunk::<8>() {
         let word = u64::from_le_bytes(bytes);
-        let mut raw = 0_u64;
-        for byte_index in 0..8_u8 {
+        debug_assert!(word & 0x80 != 0);
+        let mut raw = word & 0x7F;
+        for byte_index in 1..8_u8 {
             let bit = u32::from(byte_index) * 8;
             raw |= ((word >> bit) & 0x7F) << (u32::from(byte_index) * 7);
             if word & (0x80_u64 << bit) == 0 {

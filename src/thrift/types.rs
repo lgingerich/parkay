@@ -10,7 +10,6 @@ pub(super) mod wire_type {
     pub(in crate::thrift) const BOOL_FALSE: u8 = 2;
     pub(in crate::thrift) const I8: u8 = 3;
     pub(in crate::thrift) const I16: u8 = 4;
-    #[cfg(test)]
     pub(in crate::thrift) const I32: u8 = 5;
     pub(in crate::thrift) const I64: u8 = 6;
     pub(in crate::thrift) const DOUBLE: u8 = 7;

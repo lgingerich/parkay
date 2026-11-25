@@ -41,7 +41,7 @@ mod varint;
 pub use errors::{ThriftError, VarintTarget};
 pub use marks::Marks;
 pub use reader::{CompactReader, FieldCursor};
-#[cfg(any(test, feature = "internals"))]
+#[cfg(feature = "internals")]
 pub use types::ListHeader;
 pub use types::{ElementType, Field, FieldType};
 

@@ -204,13 +204,16 @@ impl Iterator for ColumnOrders<'_> {
 
 /// The key-value pairs of a file's metadata, decoded one at a time as they are read.
 ///
-/// Opening a file passes over the pairs without decoding them, so a malformed pair is
-/// reported here, by the item that reaches it, and ends the iteration.
+/// Opening a file passes over the pairs without decoding them, so a malformed list
+/// header or pair is reported here, by the item that reaches it, and ends the iteration.
 #[derive(Debug, Clone)]
 pub struct KeyValues<'a> {
     reader: CompactReader<'a>,
     /// Pairs not yet read. Zero once a pair has failed to decode.
     remaining: u32,
+    /// Error from the list header (e.g. a non-empty list of non-structs), yielded once
+    /// on the first `next()`.
+    header_error: Option<FooterError>,
 }
 
 impl<'a> KeyValues<'a> {
@@ -218,14 +221,21 @@ impl<'a> KeyValues<'a> {
         let mut pairs = Self {
             reader: CompactReader::new(footer, position.map_or(0, |position| position as usize)),
             remaining: 0,
+            header_error: None,
         };
-        if position.is_some() {
-            // Opening passed over this list, so its header is well-formed. A list of
-            // anything but structs holds no pairs.
-            pairs.remaining = match pairs.reader.read_list_header() {
-                Ok(header) if header.element_type() == ElementType::Struct => header.size(),
-                Ok(_) | Err(_) => 0,
-            };
+        if let Some(position) = position {
+            match pairs.reader.read_list_header() {
+                Ok(header) if header.size() == 0 => {}
+                Ok(header) if header.element_type() == ElementType::Struct => {
+                    pairs.remaining = header.size();
+                }
+                Ok(_) => {
+                    pairs.header_error = Some(invalid_value(Structure::FileMetaData, 5, position));
+                }
+                Err(error) => {
+                    pairs.header_error = Some(FooterError::from(error));
+                }
+            }
         }
         pairs
     }
@@ -235,6 +245,9 @@ impl<'a> Iterator for KeyValues<'a> {
     type Item = Result<KeyValue<'a>, FooterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(error) = self.header_error.take() {
+            return Some(Err(error));
+        }
         self.remaining = self.remaining.checked_sub(1)?;
         let pair = key_value_decode(&mut self.reader);
         if pair.is_err() {
@@ -244,6 +257,38 @@ impl<'a> Iterator for KeyValues<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.remaining as usize))
+        let upper = if self.header_error.is_some() {
+            1
+        } else {
+            self.remaining as usize
+        };
+        (0, Some(upper))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thrift::test_support::{Value, encoded};
+
+    #[test]
+    fn key_values_reports_non_empty_non_struct_list() {
+        let bytes = encoded(&Value::List(ElementType::I32, vec![Value::I32(1)]));
+        let mut iter = KeyValues::new(&bytes, Some(0));
+        assert_eq!(iter.size_hint(), (0, Some(1)));
+        assert_eq!(
+            iter.next(),
+            Some(Err(FooterError::InvalidValue {
+                structure: Structure::FileMetaData,
+                field: 5,
+                offset: 0,
+            }))
+        );
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+
+        // An empty placeholder list (0x00) is still accepted as empty.
+        let mut empty = KeyValues::new(&[0x00], Some(0));
+        assert_eq!(empty.next(), None);
     }
 }

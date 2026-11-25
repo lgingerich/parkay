@@ -2,7 +2,7 @@
 //! protocol.
 
 use super::errors::{ThriftError, VarintTarget};
-use super::types::{ElementType, Field, FieldType, ListHeader};
+use super::types::{ElementType, Field, FieldType, ListHeader, wire_type};
 use super::varint::{UnsignedVarint, decode_i64, varint_i64_error};
 
 /// Largest container size or binary length the protocol allows (the maximum `i32`).
@@ -139,11 +139,18 @@ impl<'a> CompactReader<'a> {
     /// Returns an error if the input ends or the varint overflows `i64`.
     #[inline]
     pub fn read_i64(&mut self) -> Result<i64, ThriftError> {
-        let (value, len) = decode_i64(self.input, self.position);
-        if len == 0 {
-            return Err(varint_i64_error(self.input, self.position));
+        let start = self.position;
+        if let Some(&first) = self.input.get(start)
+            && first < 0x80
+        {
+            self.position = start + 1;
+            return Ok(u64::from(first).zigzag_decode());
         }
-        self.position += usize::from(len);
+        let (value, len) = decode_i64(self.input, start);
+        if len == 0 {
+            return Err(varint_i64_error(self.input, start));
+        }
+        self.position = start + usize::from(len);
         Ok(value)
     }
 
@@ -208,6 +215,64 @@ impl<'a> CompactReader<'a> {
         self.position = data_start + bytes.len();
         debug_assert!(self.position <= self.input.len());
         Ok(bytes)
+    }
+
+    /// Fast path for reading a short (`< 15` elements) `List<I32>` whose elements are all
+    /// single-byte varints (`< 0x80`). Folds each decoded `i32` with `fold` and advances
+    /// past the list only if every element is 1 byte and `fold` returns `Some`; otherwise
+    /// leaves `self` untouched and returns `None`.
+    #[inline]
+    pub(crate) fn try_fold_short_i32_list<T>(
+        &mut self,
+        init: T,
+        mut fold: impl FnMut(T, i32) -> Option<T>,
+    ) -> Option<T> {
+        let rest = self.input.get(self.position..)?;
+        let &header = rest.first()?;
+        if header & 0x0F != wire_type::I32 || header >= 0xF0 {
+            return None;
+        }
+        let len = usize::from(header >> 4);
+        let elems = rest.get(1..1 + len)?;
+        let mut acc = init;
+        for &byte in elems {
+            if byte >= 0x80 {
+                return None;
+            }
+            acc = fold(acc, u32::from(byte).zigzag_decode())?;
+        }
+        self.position += 1 + len;
+        Some(acc)
+    }
+
+    /// Fast path for skipping a short (`< 15` elements) `List<Binary>` whose elements
+    /// each have a single-byte length (`< 0x80`). Advances past the list on success;
+    /// leaves `self` untouched and returns `false` on any other case.
+    #[inline]
+    pub(crate) fn try_skip_short_binary_list(&mut self) -> bool {
+        let Some(&header) = self.input.get(self.position) else {
+            return false;
+        };
+        if header & 0x0F != wire_type::BINARY || header >= 0xF0 {
+            return false;
+        }
+        let count = header >> 4;
+        let mut pos = self.position + 1;
+        for _ in 0..count {
+            let Some(&len) = self.input.get(pos) else {
+                return false;
+            };
+            if len >= 0x80 {
+                return false;
+            }
+            pos += 1 + usize::from(len);
+        }
+        if pos <= self.input.len() {
+            self.position = pos;
+            true
+        } else {
+            false
+        }
     }
 
     /// Reads one bool list element: `1` is true, and both `0` and `2` are false.
@@ -329,7 +394,7 @@ pub(super) fn eof(offset: usize, needed: usize) -> ThriftError {
     }
 }
 
-/// Builds an invalid-type error. Cold, to keep it out of hot loops.
+/// Builds an invalid-type error. Cold, to keep it out of hot loops (benchmarked).
 #[cold]
 pub(super) fn invalid_type(offset: usize, code: u8) -> ThriftError {
     ThriftError::InvalidType {
@@ -338,7 +403,7 @@ pub(super) fn invalid_type(offset: usize, code: u8) -> ThriftError {
     }
 }
 
-/// Builds a field-id-overflow error. Cold, to keep it out of hot loops.
+/// Builds a field-id-overflow error. Cold, to keep it out of hot loops (benchmarked).
 #[cold]
 fn field_id_overflow(offset: usize) -> ThriftError {
     ThriftError::FieldIdOverflow {

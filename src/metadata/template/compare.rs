@@ -270,19 +270,19 @@ impl Compared<'_> {
         let template = &self.template[..len];
         let mask = &self.mask[..len];
         let candidate = &self.candidate[..len];
-        let (template_words, _) = template.as_chunks::<8>();
-        let (mask_words, _) = mask.as_chunks::<8>();
-        let (candidate_words, _) = candidate.as_chunks::<8>();
-        // Differences are gathered and tested once at the end, so the loop has no
-        // branch in it.
-        let mut difference = 0;
-        let words = template_words.iter().zip(mask_words).zip(candidate_words);
-        for ((template_word, mask_word), candidate_word) in words {
-            difference |= (u64::from_le_bytes(*template_word)
-                ^ u64::from_le_bytes(*candidate_word))
-                & u64::from_le_bytes(*mask_word);
-        }
         if let Some(tail) = len.checked_sub(8) {
+            let (template_words, _) = template.as_chunks::<8>();
+            let (mask_words, _) = mask.as_chunks::<8>();
+            let (candidate_words, _) = candidate.as_chunks::<8>();
+            // Differences are gathered and tested once at the end, so the loop has no
+            // branch in it.
+            let mut difference = 0_u64;
+            let words = template_words.iter().zip(mask_words).zip(candidate_words);
+            for ((template_word, mask_word), candidate_word) in words {
+                difference |= (u64::from_le_bytes(*template_word)
+                    ^ u64::from_le_bytes(*candidate_word))
+                    & u64::from_le_bytes(*mask_word);
+            }
             // The last word, which overlaps the words above unless they left nothing
             // over. Comparing some bytes twice costs less than a loop over the rest.
             let word = |slice: &[u8]| -> u64 {
@@ -291,14 +291,34 @@ impl Compared<'_> {
                     .map_or(0, |chunk| u64::from_le_bytes(*chunk))
             };
             difference |= (word(template) ^ word(candidate)) & word(mask);
-        } else {
-            // Shorter than a word.
-            let bytes = template.iter().zip(mask).zip(candidate);
-            for ((template_byte, mask_byte), candidate_byte) in bytes {
-                difference |= u64::from((template_byte ^ candidate_byte) & mask_byte);
-            }
+            return difference == 0;
         }
-        difference == 0
+        // Adjacent varying fields are often separated by a single field-header byte,
+        // or a short 2–7 byte stretch; handle all `< 8` sizes without a byte loop.
+        if len == 1 {
+            return ((template[0] ^ candidate[0]) & mask[0]) == 0;
+        }
+        if let Some(tail) = len.checked_sub(4) {
+            let word = |slice: &[u8], off: usize| -> u32 {
+                slice[off..]
+                    .first_chunk::<4>()
+                    .map_or(0, |chunk| u32::from_le_bytes(*chunk))
+            };
+            let first = (word(template, 0) ^ word(candidate, 0)) & word(mask, 0);
+            let last = (word(template, tail) ^ word(candidate, tail)) & word(mask, tail);
+            return (first | last) == 0;
+        }
+        if let Some(tail) = len.checked_sub(2) {
+            let half = |slice: &[u8], off: usize| -> u16 {
+                slice[off..]
+                    .first_chunk::<2>()
+                    .map_or(0, |chunk| u16::from_le_bytes(*chunk))
+            };
+            let first = (half(template, 0) ^ half(candidate, 0)) & half(mask, 0);
+            let last = (half(template, tail) ^ half(candidate, tail)) & half(mask, tail);
+            return (first | last) == 0;
+        }
+        true
     }
 
     /// How many leading bytes of the candidate agree with the template on every bit
@@ -336,7 +356,23 @@ impl Compared<'_> {
 #[inline(always)]
 fn varint_end(footer: &[u8], position: usize) -> Option<usize> {
     // What `skip` does for an integer, without a reader: this runs for every length
-    // that varies in every chunk compared.
+    // that varies in every chunk compared. Nearly all footer varints are 1–8 bytes and
+    // have at least 8 bytes remaining in the footer, so one SWAR word finds the
+    // terminator without a loop or data-dependent branch.
+    let rest = footer.get(position..)?;
+    if let Some(&chunk) = rest.first_chunk::<8>() {
+        let term = !u64::from_le_bytes(chunk) & 0x8080_8080_8080_8080;
+        if term != 0 {
+            return Some(position + (term.trailing_zeros() >> 3) as usize + 1);
+        }
+    }
+    varint_end_slow(footer, position)
+}
+
+/// Tail / >8-byte varint slow path for [`varint_end`].
+#[cold]
+#[inline(never)]
+fn varint_end_slow(footer: &[u8], position: usize) -> Option<usize> {
     let last = footer
         .get(position..)?
         .iter()
