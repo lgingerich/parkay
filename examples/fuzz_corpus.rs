@@ -1,6 +1,6 @@
 //! Writes seed corpora for the fuzz targets: real footers from parquet-testing (up to
-//! 64 KiB each), small synthetic footers, and non-struct Thrift values for the Thrift
-//! targets, each prefixed with its selector byte (see `fuzz/fuzz_targets/common/mod.rs`).
+//! 64 KiB each), small synthetic footers, non-struct Thrift values for the Thrift
+//! targets, and compact byte-stream seeds for structure-aware (`*_structured`) targets.
 //!
 //! Run through `cargo xtask fuzz`, or directly with
 //! `cargo run --example fuzz_corpus -- TARGET...`.
@@ -50,7 +50,46 @@ const THRIFT_EXTRA_SEEDS: &[(&str, u8, &[u8])] = &[
         11,
         &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     ),
+    // 6-level nested struct (crosses `INLINE_STACK = 4`).
+    (
+        "deep-struct",
+        0,
+        &[0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x15, 0x02, 0, 0, 0, 0, 0, 0],
+    ),
 ];
+
+/// Builds a `List<Binary>` with 150 elements (selector 1 = `List`) to cross
+/// `BINARIES_GROWTH_COUNT_MIN = 128` and exercise `grow_bins` + `skip_list_tail_growing`.
+fn wide_binary_list_seed() -> Vec<u8> {
+    let mut seed = Vec::with_capacity(4 + 150 * 2);
+    seed.push(1); // selector: List
+    seed.push(0xF8); // long size + Binary (8)
+    seed.extend_from_slice(&[0x96, 0x01]); // varint(150)
+    for i in 0_u8..150 {
+        seed.push(0x01);
+        seed.push(i);
+    }
+    seed
+}
+
+/// Deterministic byte seeds for structure-aware (`*_structured`) targets so every top-level
+/// generator mode starts with clean coverage.
+fn structured_seeds() -> Vec<Vec<u8>> {
+    (0_u8..16)
+        .map(|variant| {
+            let mut bytes = Vec::with_capacity(64);
+            let mut state = u64::from(variant).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
+            bytes.push(variant);
+            for _ in 0..63 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                bytes.push((state >> 56) as u8);
+            }
+            bytes
+        })
+        .collect()
+}
 
 fn valid_target_name(root: &Path, target: &str) -> bool {
     !target.is_empty()
@@ -93,6 +132,14 @@ fn main() -> ExitCode {
     for target in &targets {
         let dir = root.join("fuzz/corpus").join(target);
         fs::create_dir_all(&dir).unwrap();
+        if target.ends_with("_structured") {
+            let synth = structured_seeds();
+            for (i, bytes) in synth.iter().enumerate() {
+                fs::write(dir.join(format!("synth-{i:02}")), bytes).unwrap();
+            }
+            println!("{target}: {} seeds in {}", synth.len(), dir.display());
+            continue;
+        }
         for (i, footer) in seeds.iter().enumerate() {
             let mut seed = vec![STRUCT_SELECTOR];
             seed.extend_from_slice(footer);
@@ -106,6 +153,8 @@ fn main() -> ExitCode {
                 fs::write(dir.join(format!("thrift-{name}")), seed).unwrap();
                 count += 1;
             }
+            fs::write(dir.join("thrift-wide-bin-list"), wide_binary_list_seed()).unwrap();
+            count += 1;
         }
         println!("{target}: {count} seeds in {}", dir.display());
     }

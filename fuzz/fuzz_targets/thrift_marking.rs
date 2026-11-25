@@ -1,8 +1,9 @@
 //! `skip_marking` against `skip`, and the marks against what they claim.
 //!
 //! Marking must accept what `skip` accepts and end where it ends, including when
-//! appending to non-empty `Marks` (and rolling back cleanly on error). Its marks say
-//! which bits decided where the value ends, so each of these must still skip to its end:
+//! appending to non-empty `Marks`, reusing cleared `Marks`, and rolling back cleanly on
+//! error. Its marks say which bits decided where the value ends, so each of these must
+//! still skip to its end:
 //! - the value with every unmarked bit flipped or replaced;
 //! - the value with a listed binary replaced by one of another length;
 //! - the value with an integer made longer or a multi-byte integer shortened to 1 byte.
@@ -30,7 +31,8 @@ fn assert_skips_to_its_end(bytes: &[u8], element_type: ElementType, what: &str) 
 }
 
 /// Verifies `skip_marking` when appending onto non-empty `Marks` from a non-zero input
-/// offset, plus full rollback (including zeroing the dirty tail) when marking fails.
+/// offset, reusing cleared `Marks`, plus full rollback (including zeroing the dirty tail)
+/// and exact error parity when marking fails.
 fn assert_append_and_rollback(
     data: &[u8],
     element_type: ElementType,
@@ -69,10 +71,24 @@ fn assert_append_and_rollback(
             .chain(fresh.binaries().iter().map(|&pos| pos + shift))
             .collect();
         assert_eq!(appended.binaries(), expected_bins.as_slice());
+
+        // Exercise `Marks::clear` reuse: a cleared buffer must produce identical marks.
+        appended.clear();
+        assert_eq!(appended.mask(), []);
+        assert_eq!(appended.binaries(), []);
+        let mut reused_reader = CompactReader::new(data, 1);
+        reused_reader
+            .skip_marking(element_type, &mut appended)
+            .expect("marking into cleared Marks succeeds");
+        assert_eq!(reused_reader.position(), 1 + end);
+        assert_eq!(appended.mask(), fresh.mask());
+        assert_eq!(appended.binaries(), fresh.binaries());
     } else {
-        assert!(
-            outcome.is_err(),
-            "appended marking succeeded when fresh failed"
+        let mut plain_at_one = CompactReader::new(data, 1);
+        let plain_outcome = plain_at_one.skip(element_type);
+        assert_eq!(
+            outcome, plain_outcome,
+            "skip_marking and skip disagree on error at non-zero start offset"
         );
         assert_eq!(
             appended.mask(),
@@ -213,8 +229,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let end = skipped.position();
-    assert_eq!(marked.position(), end);
-    assert_eq!(marks.mask().len(), end);
+    assert_eq!(marked.position(), end, "marking and skipping ended apart");
+    assert_eq!(
+        marks.mask().len(),
+        end,
+        "mask length differs from bytes skipped"
+    );
     assert_append_and_rollback(data, element_type, &marks, Some(end));
 
     let value = &input[..end];

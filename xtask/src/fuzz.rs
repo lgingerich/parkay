@@ -13,6 +13,14 @@ use crate::{
 /// A day; longer runs belong in a fuzzing service, not a terminal.
 const SECONDS_MAX: u64 = 86_400;
 
+/// Corpus file count at or above which a passing fuzz run automatically runs `cmin` so
+/// corpora stay compact without having to remember `--minimize`.
+const AUTO_MINIMIZE_FILES: usize = 5_000;
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent clap CLI flags for fuzz modes"
+)]
 #[derive(clap::Args)]
 pub struct Args {
     /// Fuzz targets to run (see `cargo +nightly fuzz list`).
@@ -26,15 +34,18 @@ pub struct Args {
         long,
         default_value_t = 60,
         value_parser = clap::value_parser!(u64).range(1..=SECONDS_MAX),
-        conflicts_with_all = ["replay", "minimize"]
+        conflicts_with_all = ["replay", "minimize", "coverage"]
     )]
     pub seconds: u64,
     /// Replay each target's saved `fuzz/artifacts` instead of fuzzing.
-    #[arg(long, conflicts_with = "minimize")]
+    #[arg(long, conflicts_with_all = ["minimize", "coverage"])]
     pub replay: bool,
     /// Minimize each target's saved `fuzz/corpus` with `cargo +nightly fuzz cmin`.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["replay", "coverage"])]
     pub minimize: bool,
+    /// Collect merged `llvm-cov` line/region coverage across selected corpora.
+    #[arg(long, conflicts_with_all = ["replay", "minimize"])]
+    pub coverage: bool,
 }
 
 pub fn fuzz(args: &Args) -> Result<(), String> {
@@ -45,6 +56,9 @@ pub fn fuzz(args: &Args) -> Result<(), String> {
 
     if args.replay {
         return replay(&chosen, &logs);
+    }
+    if args.coverage {
+        return coverage(&chosen, &logs);
     }
 
     // Build before launching runs so parallel fuzzing does not queue on cargo's lock.
@@ -58,7 +72,8 @@ pub fn fuzz(args: &Args) -> Result<(), String> {
         return minimize(&chosen, &logs);
     }
     seed_empty(&chosen)?;
-    explore(&chosen, args.seconds, &logs)
+    explore(&chosen, args.seconds, &logs)?;
+    auto_minimize(&chosen, &logs)
 }
 
 fn build_fuzz_targets(target: Option<&str>, logs: &Path, truncate_log: bool) -> Result<(), String> {
@@ -160,6 +175,32 @@ fn corpus_file_count(dir: &Path) -> usize {
         .count()
 }
 
+/// Returns the targets whose corpus under `corpus_root` has at least `threshold` files.
+fn bloated_targets(corpus_root: &Path, targets: &[String], threshold: usize) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| corpus_file_count(&corpus_root.join(target)) >= threshold)
+        .cloned()
+        .collect()
+}
+
+/// Automatically minimizes any target whose corpus reached [`AUTO_MINIMIZE_FILES`].
+fn auto_minimize(targets: &[String], logs: &Path) -> Result<(), String> {
+    let bloated = bloated_targets(
+        &crate::root().join("fuzz/corpus"),
+        targets,
+        AUTO_MINIMIZE_FILES,
+    );
+    if bloated.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "auto-minimizing {} bloated corpora (>= {AUTO_MINIMIZE_FILES} files)",
+        bloated.len()
+    );
+    minimize(&bloated, logs)
+}
+
 /// Seeds every empty `fuzz/corpus/TARGET` from real footers in a single invocation.
 fn seed_empty(targets: &[String]) -> Result<(), String> {
     let to_seed: Vec<&str> = targets
@@ -215,6 +256,112 @@ fn minimize(targets: &[String], logs: &Path) -> Result<(), String> {
             "corpus minimization failed in {}",
             failed.join(", ")
         ))
+    }
+}
+
+/// Runs `cargo +nightly fuzz coverage` over each selected non-empty corpus, merges the
+/// `.profdata` files, and prints an `llvm-cov report` over `src/` (excluding tests).
+fn coverage(targets: &[String], logs: &Path) -> Result<(), String> {
+    let triple = host_triple().ok_or("`rustc +nightly -vV` did not report a host triple")?;
+    let llvm_bin = nightly_llvm_bin(&triple)?;
+    let profdata_tool = llvm_bin.join(format!("llvm-profdata{}", std::env::consts::EXE_SUFFIX));
+    let cov_tool = llvm_bin.join(format!("llvm-cov{}", std::env::consts::EXE_SUFFIX));
+    if !profdata_tool.is_file() || !cov_tool.is_file() {
+        return Err(
+            "nightly `llvm-tools` not installed; run: rustup component add llvm-tools --toolchain nightly"
+                .to_owned(),
+        );
+    }
+
+    let repo = crate::root();
+    let mut profdatas = Vec::new();
+    let mut binaries = Vec::new();
+    for target in targets {
+        let corpus = repo.join("fuzz/corpus").join(target);
+        if corpus_file_count(&corpus) == 0 {
+            println!("-    {target:<22} empty corpus");
+            continue;
+        }
+        let log = logs.join(format!("{target}.cov.log"));
+        let mut command = nightly_fuzz();
+        command.args(["coverage", target]);
+        let ok = run_logged_fresh(&mut command, &log)?;
+        if !ok {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            return Err(format!(
+                "coverage failed for `{target}`:\n{}\nfull output: {}",
+                tail(&text, 20),
+                rel_path(&log)
+            ));
+        }
+        let profdata = repo
+            .join("fuzz/coverage")
+            .join(target)
+            .join("coverage.profdata");
+        let binary = repo
+            .join("fuzz/target")
+            .join(&triple)
+            .join("coverage")
+            .join(&triple)
+            .join("release")
+            .join(format!("{target}{}", std::env::consts::EXE_SUFFIX));
+        if profdata.is_file() && binary.is_file() {
+            println!("ok   {target:<22} coverage collected");
+            profdatas.push(profdata);
+            binaries.push(binary);
+        }
+    }
+    if binaries.is_empty() {
+        return Err("no non-empty corpora to measure coverage on".to_owned());
+    }
+
+    let merged = logs.join("coverage.profdata");
+    run(Command::new(&profdata_tool)
+        .args(["merge", "-sparse"])
+        .args(&profdatas)
+        .arg("-o")
+        .arg(&merged))?;
+
+    let mut report = Command::new(&cov_tool);
+    report
+        .current_dir(&repo)
+        .arg("report")
+        .arg(format!("--instr-profile={}", merged.display()))
+        .arg(&binaries[0]);
+    for bin in &binaries[1..] {
+        report.arg(format!("--object={}", bin.display()));
+    }
+    report
+        .arg("--ignore-filename-regex=(tests\\.rs|test_support\\.rs)")
+        .arg("--");
+    let mut sources = Vec::new();
+    collect_rs_files(&repo.join("src"), &mut sources);
+    sources.sort();
+    report.args(&sources);
+    run(&mut report)
+}
+
+fn nightly_llvm_bin(triple: &str) -> Result<PathBuf, String> {
+    let sysroot = output_checked(
+        Command::new("rustc")
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .args(["+nightly", "--print", "sysroot"]),
+        "`rustc +nightly --print sysroot`",
+    )?;
+    Ok(PathBuf::from(sysroot.trim())
+        .join("lib/rustlib")
+        .join(triple)
+        .join("bin"))
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in visible_entries(dir) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
     }
 }
 
@@ -417,7 +564,7 @@ fn is_panic_block_end(line: &str) -> bool {
 mod tests {
     use std::fmt::Write as _;
 
-    use super::{corpus_file_count, failure, parse_host_triple};
+    use super::{bloated_targets, corpus_file_count, failure, parse_host_triple};
     use crate::TempDir;
 
     #[test]
@@ -433,6 +580,21 @@ mod tests {
         std::fs::write(dir.join("seed-000"), b"abc").expect("write seed");
         std::fs::write(dir.join("seed-001"), b"def").expect("write seed");
         assert_eq!(corpus_file_count(&dir), 2);
+    }
+
+    #[test]
+    fn bloated_targets_selects_corpora_at_or_above_threshold() {
+        let root = TempDir::new("bloated");
+        let small = root.join("small");
+        let exact = root.join("exact");
+        std::fs::create_dir_all(&small).expect("create small");
+        std::fs::create_dir_all(&exact).expect("create exact");
+        std::fs::write(small.join("a"), b"1").expect("write");
+        std::fs::write(exact.join("a"), b"1").expect("write");
+        std::fs::write(exact.join("b"), b"2").expect("write");
+
+        let names = vec!["small".to_owned(), "exact".to_owned(), "missing".to_owned()];
+        assert_eq!(bloated_targets(&root, &names, 2), vec!["exact".to_owned()]);
     }
 
     #[test]

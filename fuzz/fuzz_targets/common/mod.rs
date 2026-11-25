@@ -6,6 +6,7 @@
 )]
 
 pub mod shapes;
+pub mod synth;
 
 use parkay::thrift::{CompactReader, ElementType, FieldCursor, SKIP_DEPTH_MAX};
 
