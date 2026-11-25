@@ -15,7 +15,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 parkay = { path = "..", features = ["internals"] }
 # The baseline the metadata targets compare against, as in `bench-support`.
-parquet = { version = "60.1.0", default-features = false }
+parquet = { version = "60.2.0", default-features = false }
 
 [[bin]]
 name = "thrift_skip"

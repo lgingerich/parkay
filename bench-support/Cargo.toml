@@ -8,7 +8,7 @@ publish = false
 license = "MIT AND Apache-2.0"
 
 [dependencies]
-parquet = { version = "60.1.0", default-features = false }
+parquet = { version = "60.2.0", default-features = false }
 
 [lints]
 workspace = true

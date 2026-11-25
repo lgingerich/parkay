@@ -24,7 +24,7 @@ thiserror = "2.0.21"
 [dev-dependencies]
 bench-support = { path = "bench-support" }
 criterion = "0.8.2"
-parquet = { version = "60.1.0", default-features = false }
+parquet = { version = "60.2.0", default-features = false }
 proptest = "1.12.0"
 
 [[bench]]
