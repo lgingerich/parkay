@@ -209,18 +209,34 @@ fn skip_varint_fast<const WITH_HEADER: bool, W: MaskWindow>(
     mask: &mut W,
 ) -> Option<usize> {
     let pos = if WITH_HEADER { start + 1 } else { start };
-    // One 8-byte load finds the end of every varint up to 8 bytes long without branching
-    // on its length, which mixes one-byte and multi-byte values from field to field.
-    let end = if let Some(chunk) = in_win.get(pos..).and_then(|r| r.first_chunk::<8>()) {
-        let terminators = !u64::from_le_bytes(*chunk) & 0x8080_8080_8080_8080;
-        if terminators != 0 {
-            pos + (terminators.trailing_zeros() >> 3) as usize + 1
-        } else {
-            skip_varint_long_fast(in_win, pos + 8)?
-        }
-    } else {
-        skip_varint_long_fast(in_win, pos)?
+    let Some(&first) = in_win.get(pos) else {
+        return skip_fail();
     };
+    // Note: the one-byte branch is load-bearing. A predicted branch lets the next field's
+    // header load start before this byte arrives; a branchless 8-byte SWAR length (one
+    // `ldr`, mask, `rbit`/`clz`) put that chain on the position dependency of every field
+    // and was 40-57% slower on every `thrift` skip benchmark (quick, partial run, 2026-11-25).
+    if first < 0x80 {
+        if WITH_HEADER {
+            mask.write_pair::<{ Marks::STRUCTURE }, { Marks::VARINT }>(start);
+        } else {
+            mask.write_byte::<{ Marks::VARINT }>(start);
+        }
+        return Some(pos + 1);
+    }
+    if let Some(chunk) = in_win.get(pos + 1..).and_then(|r| r.first_chunk::<4>()) {
+        let term = !u32::from_le_bytes(*chunk) & 0x8080_8080;
+        let tz = term.trailing_zeros();
+        if tz < 32 {
+            let idx = (tz >> 3) as usize;
+            mask.write_swar::<WITH_HEADER>(start, idx);
+            return Some(pos + 2 + idx);
+        }
+        let end = skip_varint_long_fast(in_win, pos + 5)?;
+        mask.write_run::<WITH_HEADER, { Marks::VARINT }>(start, end);
+        return Some(end);
+    }
+    let end = skip_varint_long_fast(in_win, pos + 1)?;
     mask.write_run::<WITH_HEADER, { Marks::VARINT }>(start, end);
     Some(end)
 }
